@@ -3,6 +3,12 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 KEEPER_DATA_DIR=/data
 WORKDIR /app
 
+# libgl/libglib: OpenCV (used by the bundled OCR). tesseract: optional OCR engine with
+# Hebrew/Arabic/... support (KEEPER_OCR=tesseract); add more tesseract-ocr-<lang> packages as needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng tesseract-ocr-heb \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

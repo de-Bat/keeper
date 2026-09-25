@@ -18,7 +18,7 @@ const WIDE_CATEGORIES = new Set(["github_repo", "article", "video", "product", "
 const HIDDEN_META = new Set([
   "screenshot_text", "sources", "confidence", "ingredients", "instructions", "imdb_rating", "rotten_tomatoes",
   "metacritic", "tmdb_rating", "stars", "rating", "rating_count", "description", "post_url", "imdb_votes", "tmdb_id",
-  "page_description", "page_title", "github_full_name", "year",
+  "page_description", "page_title", "github_full_name", "year", "ocr_text",
 ]);
 
 const state = {

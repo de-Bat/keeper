@@ -20,6 +20,10 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name) or default
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(os.environ.get("KEEPER_DATA_DIR", "data")).resolve())
@@ -29,6 +33,36 @@ class Settings:
     github_token: str | None = field(default_factory=lambda: os.environ.get("GITHUB_TOKEN") or None)
     # When set, every API/media request must present this token (clients: Bearer header).
     api_token: str | None = field(default_factory=lambda: os.environ.get("KEEPER_API_TOKEN") or None)
+
+    # Which analyzer identifies screenshots: auto | claude | local | hybrid | ocr
+    analyzer: str = field(default_factory=lambda: _env("KEEPER_ANALYZER", "auto").lower())
+    anthropic_api_key: str | None = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY") or None)
+    # On-prem LLM: any OpenAI-compatible server (Ollama, vLLM, LM Studio, llama.cpp server)
+    local_llm_url: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_URL") or None)
+    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL", "qwen2.5vl:7b"))
+    local_llm_api_key: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_API_KEY") or None)
+    # Set to false for text-only models: they then get the OCR text instead of the image.
+    local_llm_vision: bool = field(default_factory=lambda: _env("LOCAL_LLM_VISION", "true").lower() not in ("0", "false", "no"))
+    local_llm_timeout: float = field(default_factory=lambda: float(_env("LOCAL_LLM_TIMEOUT", "300")))
+    # hybrid mode: ask Claude when the local model's confidence is below this
+    escalate_below: int = field(default_factory=lambda: int(_env("KEEPER_ESCALATE_BELOW", "70")))
+    # OCR pre-pass: rapidocr (bundled, CPU) | tesseract (needs the binary; better for Hebrew/Arabic/...) | off
+    ocr_engine: str = field(default_factory=lambda: _env("KEEPER_OCR", "rapidocr").lower())
+    ocr_langs: str = field(default_factory=lambda: _env("KEEPER_OCR_LANGS", "eng"))  # tesseract only, e.g. eng+heb
+    # Online metadata lookups (TMDB, GitHub, recipe pages...). Turn off for air-gapped installs.
+    enrich: bool = field(default_factory=lambda: _env("KEEPER_ENRICH", "on").lower() not in ("0", "off", "false", "no"))
+
+    def resolved_analyzer(self) -> str:
+        """`auto` picks the best configured option: Claude, else the local LLM, else OCR rules."""
+        if self.analyzer != "auto":
+            return self.analyzer
+        if self.anthropic_api_key and self.local_llm_url:
+            return "hybrid"
+        if self.anthropic_api_key:
+            return "claude"
+        if self.local_llm_url:
+            return "local"
+        return "ocr"
 
     @property
     def db_path(self) -> Path:

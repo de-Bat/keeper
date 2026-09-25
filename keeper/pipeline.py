@@ -2,6 +2,8 @@
 
 import logging
 import mimetypes
+import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,15 @@ def confidence_score(value: Any) -> int | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return max(0, min(100, int(round(value))))
     return None
+
+
+def titles_match(a: str | None, b: str | None) -> bool:
+    """Loose title equality that tolerates OCR artefacts (dropped spaces, punctuation, case)."""
+    if not a or not b:
+        return False
+    norm = lambda s: re.sub(r"[^0-9a-z]", "", s.lower())  # noqa: E731
+    a, b = norm(a), norm(b)
+    return bool(a) and (a == b or SequenceMatcher(None, a, b).ratio() >= 0.9)
 
 
 def merge(analysis: dict, enrichments: list[Enrichment]) -> dict:
@@ -77,7 +88,20 @@ def merge(analysis: dict, enrichments: list[Enrichment]) -> dict:
         if url and url.startswith("http") and url not in seen:
             seen.add(url)
             unique_links.append({"label": link.get("label") or url, "url": url})
-    metadata["sources"] = sources
+    used = analysis.get("_analyzer") or ["claude"]
+    metadata["sources"] = used + sources[1:]
+    if analysis.get("_ocr_text"):
+        metadata["ocr_text"] = analysis["_ocr_text"][:5000]  # full OCR text: searchable even if identification fails
+
+    confidence = confidence_score(analysis.get("confidence"))
+    confidence_reason = analysis.get("confidence_reason") or None
+    # Claude verifies with web search itself; other analyzers get a second opinion from the
+    # authoritative source the enrichers matched (GitHub, TMDB, Open Library, the recipe page).
+    if "claude" not in used and confidence is not None and confidence < 90:
+        match = next((e for e in enrichments if e.matched_title and titles_match(analysis.get("title"), e.matched_title)), None)
+        if match:
+            confidence = max(confidence, 85)
+            confidence_reason = f"{confidence_reason or ''} Confirmed by {match.source}.".strip()
 
     alternatives = [
         {k: a.get(k) for k in ("title", "category", "year", "canonical_url", "why")}
@@ -95,8 +119,8 @@ def merge(analysis: dict, enrichments: list[Enrichment]) -> dict:
         "metadata": metadata,
         "links": unique_links,
         "tags": tags,
-        "confidence": confidence_score(analysis.get("confidence")),
-        "confidence_reason": analysis.get("confidence_reason") or None,
+        "confidence": confidence,
+        "confidence_reason": confidence_reason,
         "alternatives": alternatives,
     }
 

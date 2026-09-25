@@ -8,6 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
@@ -16,7 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .analyzer import CATEGORIES, ScreenshotAnalyzer
+from .analyzer import CATEGORIES, AnalysisError
+from .analyzers import AnalyzerRouter
 from .config import Settings
 from .db import Database
 from .pipeline import Pipeline
@@ -52,7 +54,7 @@ class ItemPatch(BaseModel):
 
 def create_app(
     settings: Settings | None = None,
-    analyzer: ScreenshotAnalyzer | None = None,
+    analyzer: Any = None,
     http: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
@@ -63,7 +65,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         client = http or httpx.AsyncClient(timeout=20)
-        state["pipeline"] = Pipeline(db, settings, analyzer or ScreenshotAnalyzer(model=settings.model), client)
+        chosen = analyzer
+        if chosen is None:
+            try:
+                chosen = AnalyzerRouter(settings, client)
+            except ValueError as e:  # misconfiguration: keep serving, report it on each item
+                logging.getLogger("keeper").error("Analyzer not available: %s", e)
+                chosen = _Unavailable(str(e))
+        state["pipeline"] = app.state.pipeline = Pipeline(db, settings, chosen, client)
         yield
         if http is None:
             await client.aclose()
@@ -84,7 +93,10 @@ def create_app(
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "api_version": API_VERSION, "auth_required": bool(settings.api_token)}
+        return {
+            "ok": True, "api_version": API_VERSION, "auth_required": bool(settings.api_token),
+            "analyzer": settings.resolved_analyzer(),
+        }
 
     @app.get("/api/sync")
     def sync(since: str | None = Query(None, description="server_time returned by the previous sync")):
@@ -233,3 +245,11 @@ def _normalize_time(value: str | None) -> str | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+class _Unavailable:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    async def analyze(self, *args, **kwargs):
+        raise AnalysisError(f"No analyzer configured: {self.reason}")

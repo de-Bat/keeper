@@ -194,6 +194,7 @@ class ScreenshotAnalyzer:
 
     async def analyze(
         self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
+        hints: str = "",
     ) -> dict:
         image, media_type = prepare_image(image, media_type)
         prompt = "Identify what this screenshot is recommending and catalogue it."
@@ -201,6 +202,7 @@ class ScreenshotAnalyzer:
             prompt += f"\n\nThe user added this note when saving it: {note}"
         if correction:
             prompt += "\n\n" + correction_prompt(correction)
+        prompt += hints  # OCR text + rule-based clues, if the OCR pre-pass found any
         messages: list[dict] = [{
             "role": "user",
             "content": [

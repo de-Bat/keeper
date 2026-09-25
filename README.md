@@ -30,6 +30,49 @@ screenshot ──► Claude (vision + web search) ──► identification ─�
 2. **Enrich.** `keeper/enrich.py` asks authoritative sources for the facts: the GitHub API for repos, TMDB and OMDb for film and TV, Open Library for books, and the recipe page's schema.org data for recipes. For anything else it reads the page's OpenGraph tags. Each enricher is best-effort: without an API key you still get what Claude found through web search.
 3. **Store & retrieve.** `keeper/db.py` keeps items, tags, and an FTS5 full-text index over titles, summaries, tags, metadata and the screenshot's text. You can filter by category and tags and edit anything.
 
+## Choosing the AI: Claude, on-prem LLM, or no LLM
+
+Set `KEEPER_ANALYZER` in `.env`:
+
+| Mode | What runs | Accuracy | Privacy / cost |
+|---|---|---|---|
+| `claude` | Claude with web search | Best: reads the screenshot, then checks online and finds the IMDb page, repo, recipe… | Screenshot is sent to Anthropic; per-request cost |
+| `local` | Your LLM (Ollama, vLLM, LM Studio, llama.cpp: anything OpenAI-compatible) | Good with a 7B+ vision model on well-known titles; no web search, so it relies on what the model knows. The metadata lookups still confirm and fill in the details | Screenshots stay on your network |
+| `hybrid` | Local first; Claude only when the local model's confidence is below `KEEPER_ESCALATE_BELOW` (default 70) or it fails | Close to `claude` | Only the hard cases leave your network |
+| `ocr` | No LLM: OCR + rules | Rough: finds GitHub/IMDb links, the platform, the poster; flags everything for review | Fully local, ~1 s on CPU |
+| `auto` (default) | `hybrid` if both are configured, else whichever is, else `ocr` | | |
+
+**On-prem LLM quick start (Ollama):**
+
+```bash
+docker compose --profile local up -d                      # starts Keeper + Ollama (GPU block in docker-compose.yml)
+docker compose exec ollama ollama pull qwen2.5vl:7b       # ~6 GB; a vision model that reads screenshots well
+# .env:
+#   LOCAL_LLM_URL=http://ollama:11434/v1
+#   LOCAL_LLM_MODEL=qwen2.5vl:7b
+#   KEEPER_ANALYZER=local          # or hybrid, with ANTHROPIC_API_KEY also set
+docker compose up -d keeper
+```
+
+Vision models that work well: `qwen2.5vl:7b` / `:32b`, `gemma3:12b` / `:27b`, `llama3.2-vision:11b`, `minicpm-v`. A 7B model wants ~8 GB of VRAM; on CPU expect 30 s–several minutes per screenshot (`LOCAL_LLM_TIMEOUT`). Text-only models (e.g. `llama3.1:8b`, `qwen2.5:14b`) also work with `LOCAL_LLM_VISION=false`: they get the OCR text instead of the image.
+
+Keeper asks the server for schema-constrained JSON and falls back to plain JSON mode for servers that don't support it. Small models' sloppy output (wrong category names, `0.8` instead of `80`, missing fields) is normalized.
+
+### OCR + rules pre-pass (runs in every mode)
+
+Before any model sees a screenshot, Keeper runs OCR locally and applies simple rules. You get:
+
+- **Full-text search over everything in the screenshot**, even when identification fails.
+- **Clues passed to the model**: GitHub and IMDb links, URLs, @handles, the app the screenshot came from (Instagram "likes" and "View all N comments", Twitter "Reposts", Reddit "r/…"), vocabulary that suggests a recipe, film, TV show or repo, and the biggest text on screen as a title candidate. Small local models gain the most, because they read small print poorly.
+- **A second opinion for non-Claude analyzers.** If GitHub, TMDB, Open Library or the recipe page confirms the title the model found, confidence goes up to at least 85 ("Confirmed by tmdb").
+
+Engines (`KEEPER_OCR`):
+- `rapidocr` (default): PaddleOCR models on ONNX Runtime. Installed by `pip`, models included (~16 MB), CPU only, ~1 s per screenshot. Very accurate on Latin and Chinese text. It can drop the spaces in large headline text ("PASTLIVES"); the model and the title check tolerate this.
+- `tesseract`: install the binary (the Docker image includes English and Hebrew) and set `KEEPER_OCR_LANGS=eng+heb`. Use it for Hebrew, Arabic, Cyrillic and other scripts.
+- `off`
+
+For a fully **air-gapped** install, combine `KEEPER_ANALYZER=local` (or `ocr`) with `KEEPER_ENRICH=off`, so TMDB, GitHub and recipe pages are never contacted.
+
 ## Confidence & corrections
 
 - **Confidence (0–100).** Claude scores its identification based on the evidence: a legible title confirmed by a matching source scores 90+, while a guess from a blurry poster or an ambiguous title (remakes, a book and its film) scores lower. The score comes with a one-line reason.
@@ -46,7 +89,7 @@ screenshot ──► Claude (vision + web search) ──► identification ─�
 ### Docker (recommended)
 
 ```bash
-cp .env.example .env              # add ANTHROPIC_API_KEY, and ideally KEEPER_API_TOKEN
+cp .env.example .env              # add ANTHROPIC_API_KEY and/or LOCAL_LLM_URL, and ideally KEEPER_API_TOKEN
 docker compose up -d --build
 # → http://<your-server>:8000
 ```
@@ -58,7 +101,7 @@ Data (the SQLite database and uploaded screenshots) lives in `./data`, mounted a
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env              # add ANTHROPIC_API_KEY
+cp .env.example .env              # add ANTHROPIC_API_KEY and/or LOCAL_LLM_URL
 uvicorn keeper.main:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
@@ -66,7 +109,11 @@ uvicorn keeper.main:create_app --factory --host 0.0.0.0 --port 8000
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | yes | Identifies screenshots |
+| `KEEPER_ANALYZER` | optional | `auto` (default), `claude`, `local`, `hybrid`, `ocr`. See [Choosing the AI](#choosing-the-ai-claude-on-prem-llm-or-no-llm) |
+| `ANTHROPIC_API_KEY` | for `claude`/`hybrid` | Identifies screenshots with Claude |
+| `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL` | for `local`/`hybrid` | Your OpenAI-compatible LLM server and model |
+| `KEEPER_OCR`, `KEEPER_OCR_LANGS` | optional | `rapidocr` (default), `tesseract` (+ languages), `off` |
+| `KEEPER_ENRICH` | optional | `off` disables all online metadata lookups |
 | `KEEPER_API_TOKEN` | recommended | Shared secret for all API and media requests. Set it whenever the server can be reached from outside localhost. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `TMDB_API_KEY` | optional | Posters, overview, cast, genres, streaming providers (v3 key or v4 read token) |
 | `OMDB_API_KEY` | optional | IMDb rating, Rotten Tomatoes, Metacritic |

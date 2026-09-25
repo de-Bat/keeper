@@ -36,6 +36,8 @@ class Enrichment:
     links: list[dict] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     source: str | None = None
+    # Name of the thing the source matched; used to double-check non-Claude identifications.
+    matched_title: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +98,7 @@ async def enrich_github(analysis: dict, settings: Settings, http: httpx.AsyncCli
         links=links,
         tags=tags,
         source="github",
+        matched_title=repo["full_name"],
     )
 
 
@@ -165,6 +168,7 @@ def _apply_tmdb(out: Enrichment, d: dict, kind: str, region: str) -> None:
     credits = d.get("credits") or {}
     meta = out.metadata
     meta["tmdb_id"] = d["id"]
+    out.matched_title = d.get("title") or d.get("name")
     meta["tmdb_rating"] = f"{d['vote_average']:.1f}/10" if d.get("vote_average") else None
     meta["genres"] = [g["name"] for g in d.get("genres") or []]
     meta["cast"] = [c["name"] for c in (credits.get("cast") or [])[:6]]
@@ -252,6 +256,7 @@ async def enrich_book(analysis: dict, settings: Settings, http: httpx.AsyncClien
         links=[{"label": "Open Library", "url": f"https://openlibrary.org{doc['key']}"}],
         tags=[s.lower() for s in (doc.get("subject") or [])[:4]],
         source="openlibrary",
+        matched_title=doc.get("title"),
     )
 
 
@@ -417,6 +422,7 @@ def recipe_from_page(page: Page) -> Enrichment | None:
         summary=recipe.get("description") or None,
         tags=tags,
         source="schema.org/Recipe",
+        matched_title=recipe.get("name"),
     )
 
 
@@ -477,6 +483,8 @@ DEFAULT_ENRICHERS = [enrich_web]
 
 async def run_enrichers(analysis: dict, settings: Settings, http: httpx.AsyncClient) -> list[Enrichment]:
     results = []
+    if not settings.enrich:
+        return results
     for fn in ENRICHERS.get(analysis.get("category"), DEFAULT_ENRICHERS):
         try:
             e = await fn(analysis, settings, http)

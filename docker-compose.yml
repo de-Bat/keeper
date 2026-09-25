@@ -7,3 +7,21 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+
+  # Optional on-prem LLM. Start with:  docker compose --profile local up -d
+  # then pull a vision model:          docker compose exec ollama ollama pull qwen2.5vl:7b
+  # and set in .env:                   LOCAL_LLM_URL=http://ollama:11434/v1
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local"]
+    restart: unless-stopped
+    volumes:
+      - ./data/ollama:/root/.ollama
+    # NVIDIA GPU (needs the NVIDIA Container Toolkit); remove this block to run on CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
