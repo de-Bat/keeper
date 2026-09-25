@@ -1,7 +1,7 @@
 [project]
-name = "keeper"
+name = "magpie"
 version = "0.1.0"
-description = "Save screenshots of recommendations; Keeper identifies the source, enriches it with metadata, and makes it searchable."
+description = "Save screenshots of recommendations; Magpie identifies the source, enriches it with metadata, and makes it searchable."
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=1.8.0",

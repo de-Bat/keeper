@@ -1,12 +1,12 @@
 # Roadmap
 
-Keeper captures **screenshots** and **links** today. The two items below complete the goal of *share anything — a URL, a screenshot, a selection, a note — and get back a typed, enriched, auto-filed item*. Each is written as a spec ready to be picked up.
+Magpie captures **screenshots** and **links** today. The two items below complete the goal of *share anything — a URL, a screenshot, a selection, a note — and get back a typed, enriched, auto-filed item*. Each is written as a spec ready to be picked up.
 
 ## 1. Text selections and notes as items
 
 **Today:** text can only be attached to a screenshot or a link as its *note*.
 
-**Goal:** a shared text selection ("You have to watch *Past Lives*, and read Celine Song's interview"), or a note typed into Keeper, becomes an item of its own that is identified, enriched and filed like the others.
+**Goal:** a shared text selection ("You have to watch *Past Lives*, and read Celine Song's interview"), or a note typed into Magpie, becomes an item of its own that is identified, enriched and filed like the others.
 
 ### Design
 
@@ -33,7 +33,7 @@ Keeper captures **screenshots** and **links** today. The two items below complet
 - the PWA's Web Share Target accepts image files, and maps shared text to the *note* of an image;
 - on iPhone, web apps can't receive shares at all (Apple doesn't support Web Share Target).
 
-**Goal:** "Share → Keeper" works for whatever you're looking at: a page in Safari, a post in X or Instagram ("Share → Keeper" or "Copy link"), a text selection.
+**Goal:** "Share → Magpie" works for whatever you're looking at: a page in Safari, a post in X or Instagram ("Share → Magpie" or "Copy link"), a text selection.
 
 ### iOS Share Extension (native app)
 
@@ -48,13 +48,13 @@ Keeper captures **screenshots** and **links** today. The two items below complet
 ### PWA (Android and desktop Chrome/Edge)
 
 - **Manifest.** In `share_target`, add `"url": "url"` and `"title": "title"` to `params`, and keep `"text": "note"` for images. `share_target.params.text` must also create text items when there are no files.
-- **Service worker.** `receiveShare` in `sw.js` stashes `{url, title, text}` in the `keeper-share-inbox` cache, as it does for files. Many Android apps put the URL in `text`, so detect a lone URL there. `importShared()` in `app.js` calls `addLink` / `addText` accordingly.
+- **Service worker.** `receiveShare` in `sw.js` stashes `{url, title, text}` in the `magpie-share-inbox` cache, as it does for files. Many Android apps put the URL in `text`, so detect a lone URL there. `importShared()` in `app.js` calls `addLink` / `addText` accordingly.
 - **iOS PWA.** Not possible (no Web Share Target in Safari). Document the options instead: the native app's Share Extension, or copying the link and pasting it into the PWA's "Save link" field.
 
 ### Also worth considering
 
 - **A bookmarklet / browser extension** for desktop: `javascript:fetch('<server>/api/items', {method:'POST', body: new URLSearchParams({url: location.href})})`. It needs the API token, so a small extension with a settings page is cleaner.
-- **An iOS Shortcut** ("Save to Keeper") that posts the shared URL or text to the API. No code in the app; it just needs documentation.
+- **An iOS Shortcut** ("Save to Magpie") that posts the shared URL or text to the API. No code in the app; it just needs documentation.
 
 **Effort:**
 - iOS Share Extension: small (~150 lines of Swift plus plist keys).

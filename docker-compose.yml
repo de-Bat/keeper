@@ -1,5 +1,5 @@
 services:
-  keeper:
+  magpie:
     build: .
     restart: unless-stopped
     ports:

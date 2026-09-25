@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Magpie</title>
+  <meta name="description" content="Save screenshots of recommendations; Magpie identifies them and looks up the details.">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="64x64" href="/static/icons/favicon.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Magpie">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151412" media="(prefers-color-scheme: dark)">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/static/icons/logo-96.png" alt="" width="36" height="36"><span>Magpie</span></div>
+    <input id="search" type="search" placeholder="Search titles, summaries, tags, text in screenshots…" autocomplete="off">
+    <button id="sync-status" class="sync-status" type="button" title="Sync status"></button>
+    <label class="btn primary" for="file-input"><span class="add-long">+ Add screenshot</span><span class="add-short">+</span></label>
+    <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+  </header>
+
+  <main class="layout">
+    <aside class="filters">
+      <section>
+        <h3>Category</h3>
+        <div id="categories" class="chips"></div>
+      </section>
+      <section>
+        <h3>Tags</h3>
+        <div id="tags" class="chips"></div>
+      </section>
+      <section class="usage-link">
+        <button class="btn small" data-action="usage">$ Usage &amp; cost</button>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div id="dropzone" class="dropzone">
+        <strong>Drop, paste (Ctrl/⌘+V) or pick screenshots, or save a link</strong>
+        <span>Facebook & Instagram posts, web pages, tweets, GitHub repos, IMDb pages, recipes… Magpie works out what it is and looks up the details.</span>
+        <form id="link-form" class="link-form" autocomplete="off">
+          <input id="link-input" type="text" inputmode="url" autocorrect="off" spellcheck="false" placeholder="Paste a link: https://…" enterkeyhint="go" autocapitalize="off">
+          <button class="btn" type="submit">Save link</button>
+        </form>
+        <input id="note" type="text" placeholder="Optional note for the next item (e.g. “Dana recommended this”)">
+      </div>
+      <div id="banner" class="banner" hidden></div>
+      <div id="active-filters" class="active-filters"></div>
+      <div id="grid" class="grid"></div>
+      <p id="empty" class="empty" hidden>Nothing here yet.</p>
+    </section>
+  </main>
+
+  <dialog id="detail"></dialog>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

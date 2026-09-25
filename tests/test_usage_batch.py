@@ -9,13 +9,13 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from keeper.analyzer import SAVE_TOOL, AnalysisError, ScreenshotAnalyzer
-from keeper.analyzers import AnalyzerRouter, LocalLLMAnalyzer
-from keeper.batch import BatchWorker
-from keeper.config import Settings
-from keeper.main import create_app
-from keeper.ocr import OcrLine, OcrResult
-from keeper.usage import Run, claude_cost, price_for
+from magpie.analyzer import SAVE_TOOL, AnalysisError, ScreenshotAnalyzer
+from magpie.analyzers import AnalyzerRouter, LocalLLMAnalyzer
+from magpie.batch import BatchWorker
+from magpie.config import Settings
+from magpie.main import create_app
+from magpie.ocr import OcrLine, OcrResult
+from magpie.usage import Run, claude_cost, price_for
 
 
 def png():
@@ -128,7 +128,7 @@ def test_claude_cost_formula():
 
 
 def test_pricing_override(monkeypatch):
-    monkeypatch.setenv("KEEPER_PRICING", '{"claude-opus-5": [4, 20]}')
+    monkeypatch.setenv("MAGPIE_PRICING", '{"claude-opus-5": [4, 20]}')
     assert price_for("claude-opus-5") == (4, 20)
 
 

@@ -6,7 +6,7 @@ import Foundation
 /// inbox, and the app imports them into its local store and upload queue.
 enum AppGroup {
     /// Must match the App Group in both targets' entitlements (see project.yml).
-    static let identifier = "group.com.example.keeper"
+    static let identifier = "group.com.example.magpie"
 
     static var container: URL {
         if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier) {

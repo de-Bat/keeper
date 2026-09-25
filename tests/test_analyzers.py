@@ -7,11 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw, ImageFont
 
-from keeper.analyzer import AnalysisError
-from keeper.analyzers import AnalyzerRouter, LocalLLMAnalyzer, normalize, parse_json, rules_analysis
-from keeper.config import Settings
-from keeper.main import create_app
-from keeper.ocr import Ocr, OcrLine, OcrResult, TesseractEngine, extract_signals
+from magpie.analyzer import AnalysisError
+from magpie.analyzers import AnalyzerRouter, LocalLLMAnalyzer, normalize, parse_json, rules_analysis
+from magpie.config import Settings
+from magpie.main import create_app
+from magpie.ocr import Ocr, OcrLine, OcrResult, TesseractEngine, extract_signals
 
 
 def png(size=(40, 60)):

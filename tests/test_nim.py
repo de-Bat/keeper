@@ -8,9 +8,9 @@ import httpx
 import pytest
 from PIL import Image
 
-from keeper.analyzer import SAVE_TOOL, AnalysisError
-from keeper.analyzers import LocalLLMAnalyzer
-from keeper.config import Settings
+from magpie.analyzer import SAVE_TOOL, AnalysisError
+from magpie.analyzers import LocalLLMAnalyzer
+from magpie.config import Settings
 
 HOSTED = "https://integrate.api.nvidia.com/v1"
 ANSWER = {"category": "movie", "source_platform": "instagram", "title": "Past Lives", "year": 2023,

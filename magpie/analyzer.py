@@ -1,0 +1,333 @@
+"""Screenshot understanding with Claude.
+
+Claude looks at the screenshot, works out what it is actually about (the movie a friend
+posted about, the repo in a "10 tools you need" post, the recipe in a reel), uses web
+search to pin down the canonical source, and reports back through a strict tool call so
+the result always matches the schema below.
+"""
+
+import base64
+import io
+import logging
+import time
+from typing import Any
+
+import anthropic
+
+from .usage import Run, claude_cost
+
+log = logging.getLogger(__name__)
+
+CATEGORIES = [
+    "movie", "tv_show", "github_repo", "recipe", "book", "music", "podcast", "video",
+    "article", "product", "place", "event", "app", "course", "other",
+]
+PLATFORMS = [
+    "facebook", "instagram", "twitter", "threads", "tiktok", "reddit", "youtube", "linkedin",
+    "whatsapp", "telegram", "pinterest", "mastodon", "bluesky", "email", "web", "other",
+]
+
+# Models that accept the server-side refusal fallback parameter.
+FALLBACK_MODELS = {"claude-opus-5", "claude-fable-5-1", "claude-fable-5"}
+
+MAX_IMAGE_EDGE = 2000
+MAX_IMAGE_BYTES = 3_500_000
+
+_nstr = {"type": ["string", "null"]}
+_strs = {"type": "array", "items": {"type": "string"}}
+
+DETAILS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "Type-specific facts. Use null / [] for anything that does not apply or you could not verify.",
+    "properties": {
+        # film & tv
+        "imdb_id": {**_nstr, "description": "e.g. tt0111161"},
+        "imdb_rating": {**_nstr, "description": "e.g. '8.1/10'"},
+        "rotten_tomatoes": {**_nstr, "description": "Tomatometer, e.g. '94%'"},
+        "metacritic": _nstr,
+        "genres": _strs,
+        "directors": _strs,
+        "cast": {**_strs, "description": "Top-billed cast, at most 6"},
+        "runtime": {**_nstr, "description": "e.g. '2h 22m' or '45m per episode'"},
+        "seasons": _nstr,
+        "network_or_studio": _nstr,
+        "where_to_watch": {**_strs, "description": "Streaming services, if known"},
+        # github
+        "github_full_name": {**_nstr, "description": "owner/repo"},
+        "programming_language": _nstr,
+        # recipes
+        "ingredients": _strs,
+        "total_time": _nstr,
+        "servings": _nstr,
+        "cuisine": _nstr,
+        "diet": _strs,
+        # books / articles / general
+        "author": _nstr,
+        "publisher": _nstr,
+        "published_date": _nstr,
+        "price": _nstr,
+        "location": _nstr,
+        # the post itself
+        "posted_by": {**_nstr, "description": "Account/person who shared it in the screenshot"},
+        "post_url": {**_nstr, "description": "URL of the social post/page itself, if visible"},
+    },
+}
+DETAILS_SCHEMA["required"] = list(DETAILS_SCHEMA["properties"])
+DETAILS_SCHEMA["additionalProperties"] = False
+
+SAVE_TOOL: dict[str, Any] = {
+    "name": "save_analysis",
+    "description": "Record the final identification of what the screenshot is about. Call exactly once, at the end.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "enum": CATEGORIES},
+            "source_platform": {
+                "type": "string", "enum": PLATFORMS,
+                "description": "Where the screenshot was taken (the app or site showing the recommendation).",
+            },
+            "title": {"type": "string", "description": "Canonical name of the thing, e.g. 'The Bear', 'astral-sh/uv', 'Shakshuka'."},
+            "subtitle": {**_nstr, "description": "Short qualifier, e.g. '2022 · TV series · FX' or 'Python package manager'."},
+            "year": {"type": ["integer", "null"]},
+            "summary": {"type": "string", "description": "2-4 sentence description of the thing itself (not of the screenshot)."},
+            "canonical_url": {
+                **_nstr,
+                "description": "Best official URL: IMDb title page for film/TV, github.com repo for code, original recipe page, article URL, etc.",
+            },
+            "image_url": {**_nstr, "description": "Direct URL to a poster/cover/preview image, only if you actually found one."},
+            "links": {
+                "type": "array",
+                "description": "Other useful links (official site, trailer, streaming page, docs...).",
+                "items": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}, "url": {"type": "string"}},
+                    "required": ["label", "url"],
+                    "additionalProperties": False,
+                },
+            },
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "5-10 short lowercase retrieval tags (genre, topic, mood, cuisine, tech...)."},
+            "screenshot_text": {"type": "string", "description": "The key text visible in the screenshot, condensed (max ~500 chars)."},
+            "confidence": {
+                "type": "integer",
+                "description": "0-100: how sure you are that title + category identify the right thing. "
+                               "90+ = confirmed by a matching source; 60-89 = likely; below 60 = a guess.",
+            },
+            "confidence_reason": {"type": "string", "description": "One sentence: what the identification rests on, or what is uncertain."},
+            "alternatives": {
+                "type": "array",
+                "description": "Up to 3 other things the screenshot could plausibly be (empty if confident).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "category": {"type": "string", "enum": CATEGORIES},
+                        "year": {"type": ["integer", "null"]},
+                        "canonical_url": _nstr,
+                        "why": {"type": "string"},
+                    },
+                    "required": ["title", "category", "year", "canonical_url", "why"],
+                    "additionalProperties": False,
+                },
+            },
+            "details": DETAILS_SCHEMA,
+        },
+        "additionalProperties": False,
+    },
+}
+SAVE_TOOL["input_schema"]["required"] = list(SAVE_TOOL["input_schema"]["properties"])
+
+SYSTEM_PROMPT = """You catalogue screenshots for a personal "save for later" library.
+
+Each screenshot usually shows a recommendation seen somewhere: a Facebook or Instagram post, a tweet, a web page, a chat message. Your job is to identify the actual thing being recommended (a movie, TV show, GitHub repository, recipe, book, product, article, ...) — not the post about it — and record it with save_analysis.
+
+How to work:
+1. Read the screenshot carefully: the app/site chrome tells you the source platform; captions, overlays, handles, and partially visible titles tell you the subject.
+2. Use web search to confirm the identity and find the canonical source. For films and TV find the IMDb page and scores; for code find the github.com repository; for recipes find the original recipe page; for articles find the article URL.
+3. Only report URLs, ratings and facts you actually saw in search results or the screenshot. Use null rather than guessing.
+4. If the screenshot recommends several things, catalogue the most prominent one and mention the others in the summary.
+5. Be honest about confidence. Score it on evidence: a clearly visible title confirmed by a matching search result is 90+; an inference from partial text, a blurry poster, or an ambiguous title (remakes, same-name books and films) is lower. List the plausible alternatives.
+6. If the user has corrected an earlier identification, treat their correction as authoritative and look up what they describe.
+7. Finish by calling save_analysis once. Do not ask the user questions."""
+
+
+class AnalysisError(Exception):
+    def __init__(self, message: str, runs: list | None = None):
+        super().__init__(message)
+        self.runs = runs or []  # usage already spent before the failure, so it is still recorded
+
+
+def correction_prompt(correction: dict) -> str:
+    """Describe a user's correction of an earlier (wrong) identification."""
+    lines = ["An earlier identification of this screenshot was wrong."]
+    if correction.get("previous_title"):
+        lines.append(f"It was identified as: {correction['previous_title']} ({correction.get('previous_category') or 'unknown type'}).")
+    facts = {k: correction.get(k) for k in ("title", "category", "year", "canonical_url")}
+    known = ", ".join(f"{k} = {v}" for k, v in facts.items() if v not in (None, ""))
+    if known:
+        lines.append(f"The user says the correct {known}.")
+    if correction.get("hint"):
+        lines.append(f"The user's correction: {correction['hint']}")
+    lines.append("Identify it again using this information.")
+    return " ".join(lines)
+
+
+def prepare_image(
+    data: bytes, media_type: str, max_edge: int = MAX_IMAGE_EDGE,
+    allowed: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp", "image/gif"),
+) -> tuple[bytes, str]:
+    """Downscale very large screenshots so they fit the API's image limits, and convert
+    formats the target model doesn't accept to JPEG."""
+    try:
+        from PIL import Image
+    except ImportError:  # Pillow is optional; send the original
+        return data, media_type
+
+    img = Image.open(io.BytesIO(data))
+    if max(img.size) <= max_edge and len(data) <= MAX_IMAGE_BYTES and media_type in allowed:
+        return data, media_type
+    img.thumbnail((max_edge, max_edge))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=88)
+    return out.getvalue(), "image/jpeg"
+
+
+class ScreenshotAnalyzer:
+    """Claude with web search/fetch. Requests can run immediately or through the Batches API."""
+
+    def __init__(
+        self,
+        client: anthropic.AsyncAnthropic | None = None,
+        model: str = "claude-opus-5",
+        effort: str | None = "medium",
+        fetch_max_tokens: int | None = 8000,
+    ):
+        self.client = client or anthropic.AsyncAnthropic()
+        self.model = model
+        self.effort = effort
+        self.fetch_max_tokens = fetch_max_tokens
+
+    # ---- request construction -------------------------------------------------
+
+    def build_params(
+        self, image: bytes | None, media_type: str | None, note: str | None = None, correction: dict | None = None,
+        hints: str = "", link_url: str | None = None, web: bool = True,
+    ) -> dict:
+        """Messages API parameters for one screenshot, or for a shared link when `image` is None
+        (JSON-serializable, so they can be stored for a batch)."""
+        if image is not None:
+            image, media_type = prepare_image(image, media_type)
+            prompt = "Identify what this screenshot is recommending and catalogue it."
+        else:
+            prompt = (f"The user shared a link, not a screenshot: {link_url}\n"
+                      "Identify what it is (or what it recommends) and catalogue it, using the page content below. "
+                      "Set canonical_url to the link unless the page is clearly about something with its own official page.")
+        if note:
+            prompt += f"\n\nThe user added this note when saving it: {note}"
+        if correction:
+            prompt += "\n\n" + correction_prompt(correction)
+        prompt += hints  # OCR text + rule-based clues, if the OCR pre-pass found any
+        # The dynamic-filtering tool versions need Opus/Sonnet 4.6+; older/smaller models get the basic ones.
+        modern = not self.model.startswith(("claude-haiku", "claude-3", "claude-sonnet-4-5", "claude-opus-4-5", "claude-opus-4-1"))
+        search_type = "web_search_20260209" if modern else "web_search_20250305"
+        fetch: dict[str, Any] = {"type": "web_fetch_20260209" if modern else "web_fetch_20250910", "name": "web_fetch", "max_uses": 3}
+        if self.fetch_max_tokens:
+            fetch["max_content_tokens"] = self.fetch_max_tokens  # a whole IMDb/recipe page can be 20k+ tokens
+        params: dict[str, Any] = dict(
+            model=self.model,
+            max_tokens=16000,
+            system=SYSTEM_PROMPT,
+            thinking={"type": "adaptive"},
+            # With readable page text there is nothing to look up: no web tools, far cheaper.
+            tools=[{"type": search_type, "name": "web_search", "max_uses": 6}, fetch, SAVE_TOOL] if web else [SAVE_TOOL],
+            tool_choice={"type": "auto"},
+            messages=[{
+                "role": "user",
+                "content": ([
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                                 "data": base64.standard_b64encode(image).decode()}},
+                ] if image is not None else []) + [{"type": "text", "text": prompt}],
+            }],
+        )
+        if self.effort and not self.model.startswith("claude-haiku"):
+            params["output_config"] = {"effort": self.effort}
+        return params
+
+    # ---- execution ------------------------------------------------------------
+
+    async def analyze(
+        self, image: bytes | None, media_type: str | None, note: str | None = None, correction: dict | None = None,
+        hints: str = "", link_url: str | None = None, web: bool = True,
+    ) -> dict:
+        return await self.run(self.build_params(image, media_type, note, correction, hints, link_url, web))
+
+    async def run(self, params: dict) -> dict:
+        """Run the identification loop in real time."""
+        run = Run("claude", model=self.model, mode="realtime")
+        return await self._loop(params, run, first=None, runs=[run])
+
+    async def finish(self, params: dict, message: Any) -> dict:
+        """Continue from a batch result. Its tokens are billed at batch rates; any
+        follow-up turns (rare: pause_turn or a missing save_analysis) run in real time."""
+        batch_run = Run("claude", model=self.model, mode="batch")
+        batch_run.add_claude_usage(getattr(message, "usage", None), getattr(message, "model", None))
+        batch_run.cost_usd = claude_cost(batch_run)
+        follow_up = Run("claude", model=self.model, mode="realtime")
+        return await self._loop(params, follow_up, first=message, runs=[batch_run, follow_up])
+
+    async def _loop(self, params: dict, run: Run, first: Any, runs: list[Run]) -> dict:
+        messages = list(params["messages"])
+        started = time.monotonic()
+        nudged = False
+
+        def done() -> list[dict]:
+            run.duration_ms += int((time.monotonic() - started) * 1000)
+            run.cost_usd = claude_cost(run)
+            return [r.to_dict() for r in runs if r.requests]
+
+        try:
+            for _ in range(8):
+                if first is not None:
+                    response, first = first, None
+                else:
+                    response = await self._create({**params, "messages": messages})
+                    run.add_claude_usage(getattr(response, "usage", None), getattr(response, "model", None))
+                if response.stop_reason == "refusal":
+                    raise AnalysisError("The model declined to analyze this screenshot.")
+
+                for block in response.content:
+                    if block.type == "tool_use" and block.name == "save_analysis":
+                        result = dict(block.input)
+                        result["_runs"] = done()
+                        return result
+
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason == "pause_turn":
+                    continue  # long server-side search turn; resend to let it continue
+                if response.stop_reason == "tool_use":
+                    # A client tool other than save_analysis — we don't have any, so report back.
+                    messages.append({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": b.id, "is_error": True, "content": "Unknown tool."}
+                        for b in response.content if b.type == "tool_use"
+                    ]})
+                    continue
+                if nudged:
+                    break
+                nudged = True
+                messages.append({"role": "user", "content": "Please record your findings now by calling save_analysis."})
+            raise AnalysisError("The model did not return an analysis.")
+        except AnalysisError as e:
+            e.runs = done()
+            raise
+        except anthropic.APIError as e:
+            e.magpie_runs = done()  # type: ignore[attr-defined]
+            raise
+
+    async def _create(self, params: dict):
+        if self.model in FALLBACK_MODELS:
+            return await self.client.beta.messages.create(
+                **params, betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            )
+        return await self.client.messages.create(**params)

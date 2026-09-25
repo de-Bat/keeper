@@ -9,12 +9,12 @@ def public_dns(monkeypatch):
         if "internal" in host or host == "localhost":
             return ["10.0.0.5"]
         return ["93.184.216.34"]
-    monkeypatch.setattr("keeper.fetch.resolve_host", resolve)
+    monkeypatch.setattr("magpie.fetch.resolve_host", resolve)
 
 
 @pytest.fixture(autouse=True)
 def fresh_page_cache():
-    from keeper import enrich
+    from magpie import enrich
     enrich._PAGE_CACHE.clear()
     yield
     enrich._PAGE_CACHE.clear()

@@ -7,13 +7,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from keeper.analyzer import ScreenshotAnalyzer
-from keeper.analyzers import AnalyzerRouter
-from keeper.config import Settings
-from keeper.fetch import BlockedURL, check_url
-from keeper.links import classify, normalize_url
-from keeper.main import create_app
-from keeper.readability import extract
+from magpie.analyzer import ScreenshotAnalyzer
+from magpie.analyzers import AnalyzerRouter
+from magpie.config import Settings
+from magpie.fetch import BlockedURL, check_url
+from magpie.links import classify, normalize_url
+from magpie.main import create_app
+from magpie.readability import extract
 
 ARTICLE = """<html><head><title>Why uv is fast | Astral</title>
 <meta property="og:site_name" content="Astral"><meta name="author" content="Charlie Marsh">
@@ -251,6 +251,6 @@ def test_redirects_to_private_addresses_are_blocked(tmp_path):
 
 
 def test_private_addresses_can_be_allowed(monkeypatch):
-    monkeypatch.setenv("KEEPER_ALLOW_PRIVATE_URLS", "true")
+    monkeypatch.setenv("MAGPIE_ALLOW_PRIVATE_URLS", "true")
     import asyncio
     asyncio.run(check_url("http://192.168.1.10/recipes/1"))
