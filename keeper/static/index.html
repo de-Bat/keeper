@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keeper</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📌</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">📌 Keeper</div>
+    <input id="search" type="search" placeholder="Search titles, summaries, tags, text in screenshots…" autocomplete="off">
+    <label class="btn primary" for="file-input">+ Add screenshot</label>
+    <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+  </header>
+
+  <main class="layout">
+    <aside class="filters">
+      <section>
+        <h3>Category</h3>
+        <div id="categories" class="chips"></div>
+      </section>
+      <section>
+        <h3>Tags</h3>
+        <div id="tags" class="chips"></div>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div id="dropzone" class="dropzone">
+        <strong>Drop, paste (Ctrl/⌘+V) or pick screenshots</strong>
+        <span>Facebook & Instagram posts, web pages, tweets… Keeper works out what's being recommended and looks up the details.</span>
+        <input id="note" type="text" placeholder="Optional note for the next upload (e.g. “Dana recommended this”)">
+      </div>
+      <div id="active-filters" class="active-filters"></div>
+      <div id="grid" class="grid"></div>
+      <p id="empty" class="empty" hidden>Nothing here yet.</p>
+    </section>
+  </main>
+
+  <dialog id="detail"></dialog>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
