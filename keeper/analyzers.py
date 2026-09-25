@@ -9,6 +9,7 @@ All of them get the OCR pre-pass (see ocr.py) and return the same dict shape as
 analyzer.SAVE_TOOL, so the rest of the pipeline doesn't care which one ran.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -126,11 +127,22 @@ def hints_prompt(ocr: OcrResult | None, signals: Signals | None) -> str:
 
 
 class LocalLLMAnalyzer:
-    """On-prem model via the OpenAI-compatible /chat/completions API."""
+    """A model behind an OpenAI-compatible /chat/completions API: Ollama, vLLM, LM Studio,
+    llama.cpp, hosted OpenAI-compatible providers, or NVIDIA NIM (self-hosted or build.nvidia.com)."""
+
+    RETRY_STATUSES = (429, 502, 503, 504)
+    MAX_RETRIES = 3
 
     def __init__(self, settings: Settings, http: httpx.AsyncClient | None = None):
         if not settings.local_llm_url:
             raise ValueError("LOCAL_LLM_URL is not set")
+        self.provider = settings.resolved_llm_provider()
+        self.max_image_edge = settings.local_llm_max_image_edge
+        # NIM: JSON schema via response_format on newer releases, else its nvext.guided_json extension.
+        self.formats = ("json_schema", "nvext", "json_object", "none") if self.provider == "nim" else self.FORMATS
+        # NIM vision models accept JPEG/PNG only.
+        self.image_types = ("image/png", "image/jpeg") if self.provider == "nim" else ("image/png", "image/jpeg", "image/webp", "image/gif")
+        self._sleep = asyncio.sleep
         self.url = settings.local_llm_url.rstrip("/") + "/chat/completions"
         self.model = settings.local_llm_model
         self.vision = settings.local_llm_vision
@@ -142,7 +154,7 @@ class LocalLLMAnalyzer:
 
     @property
     def label(self) -> str:
-        return f"local:{self.model}"
+        return f"{'nim' if self.provider == 'nim' else 'local'}:{self.model}"
 
     async def analyze(self, image: bytes | None, media_type: str | None, note: str | None = None,
                       correction: dict | None = None, hints: str = "", link_url: str | None = None, web: bool = True) -> dict:
@@ -162,7 +174,7 @@ class LocalLLMAnalyzer:
 
         content: list[dict] = [{"type": "text", "text": prompt}]
         if self.vision and image is not None:
-            data, mt = prepare_image(image, media_type)
+            data, mt = prepare_image(image, media_type, self.max_image_edge, self.image_types)
             content.append({"type": "image_url", "image_url": {"url": f"data:{mt};base64,{base64.b64encode(data).decode()}"}})
         body = {
             "model": self.model,
@@ -170,7 +182,7 @@ class LocalLLMAnalyzer:
             "temperature": 0.1,
             "stream": False,
         }
-        run = Run("local", model=self.model, mode="local")
+        run = Run("nim" if self.provider == "nim" else "local", model=self.model, mode="local")
         started = time.monotonic()
         try:
             text, usage = await self._complete(body)
@@ -195,16 +207,18 @@ class LocalLLMAnalyzer:
     async def _complete(self, body: dict) -> tuple[str, dict]:
         # Prefer schema-constrained decoding; step down for servers that don't support it,
         # and remember what worked so later requests skip the failed attempts.
-        for mode in self.FORMATS[self.FORMATS.index(self._format_mode):]:
+        for mode in self.formats[self.formats.index(self._format_mode):]:
             req = dict(body)
             if mode == "json_schema":
                 req["response_format"] = {"type": "json_schema", "json_schema": {"name": "save_analysis", "schema": SCHEMA, "strict": True}}
+            elif mode == "nvext":
+                req["nvext"] = {"guided_json": SCHEMA}
             elif mode == "json_object":
                 req["response_format"] = {"type": "json_object"}
-            try:
-                r = await self.http.post(self.url, json=req, headers=self.headers, timeout=self.timeout)
-            except httpx.HTTPError as e:
-                raise AnalysisError(f"Can't reach the local LLM at {self.url}: {e!r}") from e
+            r = await self._post(req)
+            if r.status_code in (401, 403):
+                hint = " (NVIDIA_API_KEY / LOCAL_LLM_API_KEY)" if self.provider == "nim" else " (LOCAL_LLM_API_KEY)"
+                raise AnalysisError(f"The LLM server rejected the API key{hint}: {r.text[:200]}")
             if r.status_code in (400, 422) and mode != "none":
                 log.info("Local LLM rejected response_format=%s (%s); trying a simpler format", mode, r.text[:200])
                 continue
@@ -219,6 +233,24 @@ class LocalLLMAnalyzer:
             except (KeyError, IndexError, ValueError, TypeError) as e:
                 raise AnalysisError(f"Unexpected reply from the local LLM: {r.text[:300]}") from e
         raise AnalysisError("The local LLM rejected every request format.")
+
+    async def _post(self, req: dict) -> httpx.Response:
+        """POST with retries on rate limits and temporary unavailability (the hosted NVIDIA API
+        allows ~40 requests/minute; a self-hosted NIM answers 503 while the model loads)."""
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                r = await self.http.post(self.url, json=req, headers=self.headers, timeout=self.timeout)
+            except httpx.HTTPError as e:
+                raise AnalysisError(f"Can't reach the local LLM at {self.url}: {e!r}") from e
+            if r.status_code not in self.RETRY_STATUSES or attempt == self.MAX_RETRIES:
+                return r
+            try:
+                wait = float(r.headers.get("retry-after", ""))
+            except ValueError:
+                wait = 2.0 * 2 ** attempt
+            log.info("LLM server answered %s; retrying in %.0fs", r.status_code, wait)
+            await self._sleep(min(wait, 30.0))
+        return r
 
 
 def rules_analysis(ocr: OcrResult | None, signals: Signals | None, note: str | None = None) -> dict:

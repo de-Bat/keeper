@@ -25,3 +25,25 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Optional NVIDIA NIM (TensorRT-LLM/vLLM-optimized, NVIDIA GPUs only). Needs a free NGC API key:
+  #   echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+  #   docker compose --profile nim up -d
+  # and in .env:  LOCAL_LLM_URL=http://nim:8000/v1   LOCAL_LLM_MODEL=<the model id the NIM serves>
+  # Pick a vision NIM from https://build.nvidia.com (filter: vision) and set NIM_IMAGE to its container.
+  nim:
+    image: ${NIM_IMAGE:-nvcr.io/nim/meta/llama-3.2-11b-vision-instruct:latest}
+    profiles: ["nim"]
+    restart: unless-stopped
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+    volumes:
+      - ./data/nim-cache:/opt/nim/.cache
+    shm_size: 16gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

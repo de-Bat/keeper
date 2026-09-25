@@ -63,7 +63,7 @@ Set `KEEPER_ANALYZER` in `.env`:
 | Mode | What runs | Accuracy | Privacy / cost |
 |---|---|---|---|
 | `claude` | Claude with web search | Best: reads the screenshot, then checks online and finds the IMDb page, repo, recipe… | Screenshot is sent to Anthropic; per-request cost |
-| `local` | Your LLM (Ollama, vLLM, LM Studio, llama.cpp: anything OpenAI-compatible) | Good with a 7B+ vision model on well-known titles; no web search, so it relies on what the model knows. The metadata lookups still confirm and fill in the details | Screenshots stay on your network |
+| `local` | Your LLM (Ollama, vLLM, LM Studio, llama.cpp, **NVIDIA NIM**: anything OpenAI-compatible) | Good with a 7B+ vision model on well-known titles; no web search, so it relies on what the model knows. The metadata lookups still confirm and fill in the details | Screenshots stay on your network, unless you point it at a hosted API such as NVIDIA's build.nvidia.com |
 | **`hybrid`** (recommended; the default in `.env.example`) | Local first; Claude only when the local model's confidence is below `KEEPER_ESCALATE_BELOW` (default 70) or it fails. If the local server is down, Claude is used and the local server is retried after 5 minutes | Close to `claude` | Only the hard cases leave your network; ~$0.05/screenshot |
 | `ocr` | No LLM: OCR + rules | Rough: finds GitHub/IMDb links, the platform, the poster; flags everything for review | Fully local, ~1 s on CPU |
 | `auto` (default) | `hybrid` if both are configured, else whichever is, else `ocr` | | |
@@ -154,6 +154,7 @@ uvicorn keeper.main:create_app --factory --host 0.0.0.0 --port 8000
 | `KEEPER_ANALYZER` | optional | `auto` (default), `claude`, `local`, `hybrid`, `ocr`. See [Choosing the AI](#choosing-the-ai-claude-on-prem-llm-or-no-llm) |
 | `ANTHROPIC_API_KEY` | for `claude`/`hybrid` | Identifies screenshots with Claude |
 | `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL` | for `local`/`hybrid` | Your OpenAI-compatible LLM server and model |
+| `LOCAL_LLM_PROVIDER`, `NVIDIA_API_KEY` | optional | `nim` for NVIDIA NIM (auto-detected from NVIDIA's API URL or an `nvapi-` key); the key for build.nvidia.com |
 | `KEEPER_OCR`, `KEEPER_OCR_LANGS` | optional | `rapidocr` (default), `tesseract` (+ languages), `off` |
 | `KEEPER_ENRICH` | optional | `off` disables all online metadata lookups |
 | `KEEPER_ALLOW_PRIVATE_URLS` | optional | `true` lets Keeper fetch links on private/LAN addresses (blocked by default) |

@@ -42,6 +42,37 @@ Point `LOCAL_LLM_URL` at any OpenAI-compatible server. Keeper asks for schema-co
 | **vLLM** | Highest throughput on NVIDIA GPUs; strict JSON-schema decoding | `http://gpu-box:8000/v1` |
 | **llama.cpp** (`llama-server`) | Minimal footprint; GGUF models; CPU or GPU | `http://host:8080/v1` |
 | **LM Studio** | Desktop GUI, good on Macs (MLX) | `http://localhost:1234/v1` |
+| **NVIDIA NIM** | Optimized containers for NVIDIA GPUs; also hosted at build.nvidia.com. See [NVIDIA NIM](#nvidia-nim) below | `http://nim:8000/v1` (compose `--profile nim`) or `https://integrate.api.nvidia.com/v1` |
+
+### NVIDIA NIM
+
+[NIM](https://developer.nvidia.com/nim) packages models as optimized inference containers (TensorRT-LLM / vLLM under the hood) with an OpenAI-compatible API. Keeper supports it in two forms:
+
+| | Hosted: build.nvidia.com | Self-hosted NIM container |
+|---|---|---|
+| Settings | `LOCAL_LLM_URL=https://integrate.api.nvidia.com/v1`, `NVIDIA_API_KEY=nvapi-…`, `LOCAL_LLM_MODEL=meta/llama-3.2-90b-vision-instruct` (or another vision model from the catalog) | `docker compose --profile nim up -d` with `NGC_API_KEY` and `NIM_IMAGE` set, then `LOCAL_LLM_URL=http://nim:8000/v1` and `LOCAL_LLM_MODEL=<model id>` |
+| Hardware | none | NVIDIA GPU (data-center or RTX), large image (tens of GB) |
+| Cost | free for development (~40 requests/minute); production use needs NVIDIA AI Enterprise | free under the NVIDIA Developer Program for development and research (up to 16 GPUs); **production use needs an NVIDIA AI Enterprise license (~$4,500 per GPU per year)** |
+| Privacy | screenshots go to NVIDIA's cloud | stays on your machine |
+
+What Keeper does specifically for NIM (detected automatically from NVIDIA's API URL or an `nvapi-` key, or set `LOCAL_LLM_PROVIDER=nim`):
+- **Structured output:** asks for JSON-schema output through `response_format`. If the NIM release doesn't support that, it falls back to NIM's own `nvext.guided_json`, so output stays schema-valid on older NIMs too.
+- **Images:** converts WebP and GIF to JPEG, since NIM vision models take JPEG/PNG only. `LOCAL_LLM_MAX_IMAGE_EDGE` sizes images down for speed.
+- **Retries:** retries 429 responses (the hosted rate limit) and 503 responses (a self-hosted NIM that is still loading its model), honouring `Retry-After`.
+- **Reporting:** shows up as `nim:<model>` in the Usage & cost report. Hosted NIM is recorded at $0; set `KEEPER_LOCAL_COST_PER_HOUR` for a self-hosted GPU.
+
+**Is it worth it for Keeper?**
+- **Yes, if:**
+  - you already run NVIDIA GPUs with NIM (or your company is standardized on NVIDIA AI Enterprise);
+  - or you want the fastest inference per GPU from a data-center card;
+  - or you want to **try large vision models (e.g. Llama 3.2 90B Vision) without owning the hardware**, through the hosted API.
+- **Probably not, for a single-user home server:**
+  - At ~10 screenshots a day, NIM's throughput advantage doesn't matter.
+  - Ollama is simpler: one small binary, `ollama pull`, no NGC account.
+  - Ollama runs on AMD, Apple Silicon and CPU; NIM is NVIDIA-only.
+  - Ollama has a much larger model catalog.
+  - NIM's license makes anything beyond development and research a paid product.
+- **Recommendation:** Ollama with `qwen3-vl:8b` for self-hosting; hosted NIM as a free way to test bigger models before deciding what hardware to buy.
 
 ### Vision models (read the screenshot itself)
 
@@ -96,6 +127,7 @@ Change one thing at a time and use the app for a week, then compare:
 ## Sources
 
 - Open vision-language models, 2026: [BentoML guide](https://www.bentoml.com/blog/multimodal-ai-a-guide-to-open-source-vision-language-models), [Labellerr](https://www.labellerr.com/blog/top-open-source-vision-language-models/), [SiliconFlow](https://www.siliconflow.com/articles/best-open-source-multimodal-models-2025), [Overshoot VLM survey](https://www.overshoot.ai/blogs/vlm-survey-2026)
+- NVIDIA NIM: [NIM for developers](https://developer.nvidia.com/nim), [NIM for VLMs: image input and structured generation](https://docs.nvidia.com/nim/vision-language-models/1.0.0/structured-generation.html), [Llama 3.2 Vision on build.nvidia.com](https://build.nvidia.com/meta/llama-3.2-90b-vision-instruct), [free NIM access for Developer Program members](https://developer.nvidia.com/blog/access-to-nvidia-nim-now-available-free-to-developer-program-members), [NIM API pricing and limits](https://decodethefuture.org/en/nvidia-nim-api-pricing-limits-guide/), [self-hosting guide](https://www.spheron.network/blog/nvidia-nim-self-host-deployment-guide/)
 - Qwen3-VL sizes and hardware: [local-llm.net](https://www.local-llm.net/models/qwen3-vl/), [InsiderLLM Qwen guide](https://insiderllm.com/guides/qwen-models-guide/), [LocalLLM.in Ollama VRAM guide](https://localllm.in/blog/ollama-vram-requirements-for-local-llms)
 - Gemma 4: [Google AI for Developers](https://ai.google.dev/gemma/docs/core), [Hugging Face docs](https://huggingface.co/docs/transformers/model_doc/gemma4), [Edge AI and Vision Alliance](https://www.edge-ai-vision.com/2026/04/google-pushes-multimodal-ai-further-onto-edge-devices-with-gemma-4/)
 - OCR, 2026: [Roboflow OCR ranking](https://blog.roboflow.com/best-open-source-ocr-models/), [Spheron comparison](https://www.spheron.network/blog/best-open-source-ocr-vlm-self-host-gpu-cloud-2026/), [Modal comparison](https://modal.com/blog/8-top-open-source-ocr-models-compared), [PaddleOCR-VL-1.5 paper](https://arxiv.org/pdf/2601.21957), [Koncile on Tesseract in 2026](https://www.koncile.ai/en/ressources/is-tesseract-still-the-best-open-source-ocr), [CodeSOTA PaddleOCR vs Tesseract](https://www.codesota.com/ocr/paddleocr-vs-tesseract)

@@ -40,7 +40,12 @@ class Settings:
     # On-prem LLM: any OpenAI-compatible server (Ollama, vLLM, LM Studio, llama.cpp server)
     local_llm_url: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_URL") or None)
     local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL", "qwen3-vl:8b"))
-    local_llm_api_key: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_API_KEY") or None)
+    local_llm_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("LOCAL_LLM_API_KEY") or os.environ.get("NVIDIA_API_KEY") or None)
+    # openai (Ollama, vLLM, LM Studio, llama.cpp…) | nim (NVIDIA NIM, self-hosted or build.nvidia.com) | auto
+    local_llm_provider: str = field(default_factory=lambda: _env("LOCAL_LLM_PROVIDER", "auto").lower())
+    # Longest image edge sent to the local model (smaller = faster, fewer tokens)
+    local_llm_max_image_edge: int = field(default_factory=lambda: int(_env("LOCAL_LLM_MAX_IMAGE_EDGE", "2000")))
     # Set to false for text-only models: they then get the OCR text instead of the image.
     local_llm_vision: bool = field(default_factory=lambda: _env("LOCAL_LLM_VISION", "true").lower() not in ("0", "false", "no"))
     local_llm_timeout: float = field(default_factory=lambda: float(_env("LOCAL_LLM_TIMEOUT", "300")))
@@ -60,6 +65,14 @@ class Settings:
 
     # Online metadata lookups (TMDB, GitHub, recipe pages...). Turn off for air-gapped installs.
     enrich: bool = field(default_factory=lambda: _env("KEEPER_ENRICH", "on").lower() not in ("0", "off", "false", "no"))
+
+    def resolved_llm_provider(self) -> str:
+        if self.local_llm_provider != "auto":
+            return self.local_llm_provider
+        url, key = (self.local_llm_url or "").lower(), self.local_llm_api_key or ""
+        if "api.nvidia.com" in url or key.startswith("nvapi-"):
+            return "nim"
+        return "openai"
 
     def resolved_analyzer(self) -> str:
         """`auto` picks the best configured option: Claude, else the local LLM, else OCR rules."""

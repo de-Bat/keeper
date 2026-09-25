@@ -172,19 +172,21 @@ def correction_prompt(correction: dict) -> str:
     return " ".join(lines)
 
 
-def prepare_image(data: bytes, media_type: str) -> tuple[bytes, str]:
-    """Downscale very large screenshots so they fit the API's image limits."""
+def prepare_image(
+    data: bytes, media_type: str, max_edge: int = MAX_IMAGE_EDGE,
+    allowed: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp", "image/gif"),
+) -> tuple[bytes, str]:
+    """Downscale very large screenshots so they fit the API's image limits, and convert
+    formats the target model doesn't accept to JPEG."""
     try:
         from PIL import Image
     except ImportError:  # Pillow is optional; send the original
         return data, media_type
 
     img = Image.open(io.BytesIO(data))
-    if max(img.size) <= MAX_IMAGE_EDGE and len(data) <= MAX_IMAGE_BYTES and media_type in (
-        "image/png", "image/jpeg", "image/webp", "image/gif",
-    ):
+    if max(img.size) <= max_edge and len(data) <= MAX_IMAGE_BYTES and media_type in allowed:
         return data, media_type
-    img.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE))
+    img.thumbnail((max_edge, max_edge))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     out = io.BytesIO()
