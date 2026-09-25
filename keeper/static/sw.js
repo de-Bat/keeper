@@ -1,7 +1,7 @@
 // Keeper service worker: makes the app open and render offline.
 // Library data and queued changes live in IndexedDB (see app.js); this worker only
 // caches the app shell and images, and hands shared screenshots to the page.
-const VERSION = "v2";
+const VERSION = "v3";
 const SHELL = `keeper-shell-${VERSION}`;
 const IMAGES = "keeper-images";
 const SHELL_FILES = [

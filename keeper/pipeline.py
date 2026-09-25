@@ -14,6 +14,8 @@ import httpx
 from .analyzer import AnalysisError
 from .analyzers import AnalyzerRouter, Deferred
 from .usage import Run, claude_cost
+from . import links, readability
+from .enrich import fetch_page
 from .config import Settings
 from .db import Database, normalize_tag
 from .enrich import Enrichment, run_enrichers
@@ -165,6 +167,8 @@ class Pipeline:
         item = self.db.get_item(item_id)
         if not item:
             return None
+        if item.get("kind") == "url":
+            return await self.process_url(item_id, correction, purpose)
         path = self.settings.uploads_dir / item["image_file"]
         media_type = mimetypes.guess_type(path.name)[0] or "image/png"
         context = None
@@ -186,6 +190,52 @@ class Pipeline:
             return analysis
 
         return await self._run(item_id, purpose, identify(), corrected=bool(correction))
+
+    async def process_url(self, item_id: str, correction: dict | None = None, purpose: str = "analyze") -> dict | None:
+        """Identify a shared link: by URL pattern / structured data if possible (no model, free),
+        otherwise from the page's reader-view text with the configured model, otherwise a generic card."""
+        item = self.db.get_item(item_id)
+        if not item:
+            return None
+        url = item["source_url"]
+        page = await fetch_page(url, self.http)
+        article = readability.extract(page.html, page.url) if page else None
+        known = None if correction else links.classify(url, page)
+        router = self.analyzer if isinstance(self.analyzer, AnalyzerRouter) else None
+
+        async def identify() -> dict:
+            if known:
+                analysis = known
+            elif router and router.mode != "ocr":
+                context = None
+                if correction:
+                    context = {**correction, "previous_title": item.get("title"), "previous_category": item.get("category")}
+                readable = bool(article and article.word_count >= 150)
+                analysis = await router.analyze(
+                    None, None, note=item.get("note"), correction=context, interactive=purpose != "analyze",
+                    link_url=url, page_hints=links.page_context(url, page, article), web=not readable,
+                )
+                analysis["_analyzer"] = ["link", "readability"] + analysis.get("_analyzer", [])
+            else:
+                analysis = links.generic(url, page, article, item.get("note"))
+            return self._finish_link(url, analysis, article, correction)
+
+        return await self._run(item_id, purpose, identify(), corrected=bool(correction))
+
+    def _finish_link(self, url: str, analysis: dict, article, correction: dict | None) -> dict:
+        analysis.setdefault("source_platform", links.platform_of(url))
+        if not analysis.get("canonical_url"):
+            analysis["canonical_url"] = url
+        if analysis["canonical_url"] != url:
+            analysis.setdefault("links", []).insert(0, {"label": "Shared link", "url": url})
+        if article and article.text and not analysis.get("screenshot_text"):
+            analysis["_ocr_text"] = article.text  # searchable, like a screenshot's OCR text
+        if correction:
+            explicit = {k: correction[k] for k in CORRECTABLE if correction.get(k) not in (None, "")}
+            analysis.update(explicit)
+            if explicit:
+                analysis["confidence"], analysis["confidence_reason"] = 100, "Corrected by you."
+        return analysis
 
     async def correct(self, item_id: str, correction: dict) -> dict | None:
         """Apply a user's correction. With a free-text hint the model looks again; otherwise the

@@ -210,12 +210,18 @@ class ScreenshotAnalyzer:
     # ---- request construction -------------------------------------------------
 
     def build_params(
-        self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
-        hints: str = "",
+        self, image: bytes | None, media_type: str | None, note: str | None = None, correction: dict | None = None,
+        hints: str = "", link_url: str | None = None, web: bool = True,
     ) -> dict:
-        """Messages API parameters for one screenshot (JSON-serializable, so they can be stored for a batch)."""
-        image, media_type = prepare_image(image, media_type)
-        prompt = "Identify what this screenshot is recommending and catalogue it."
+        """Messages API parameters for one screenshot, or for a shared link when `image` is None
+        (JSON-serializable, so they can be stored for a batch)."""
+        if image is not None:
+            image, media_type = prepare_image(image, media_type)
+            prompt = "Identify what this screenshot is recommending and catalogue it."
+        else:
+            prompt = (f"The user shared a link, not a screenshot: {link_url}\n"
+                      "Identify what it is (or what it recommends) and catalogue it, using the page content below. "
+                      "Set canonical_url to the link unless the page is clearly about something with its own official page.")
         if note:
             prompt += f"\n\nThe user added this note when saving it: {note}"
         if correction:
@@ -232,15 +238,15 @@ class ScreenshotAnalyzer:
             max_tokens=16000,
             system=SYSTEM_PROMPT,
             thinking={"type": "adaptive"},
-            tools=[{"type": search_type, "name": "web_search", "max_uses": 6}, fetch, SAVE_TOOL],
+            # With readable page text there is nothing to look up: no web tools, far cheaper.
+            tools=[{"type": search_type, "name": "web_search", "max_uses": 6}, fetch, SAVE_TOOL] if web else [SAVE_TOOL],
             tool_choice={"type": "auto"},
             messages=[{
                 "role": "user",
-                "content": [
+                "content": ([
                     {"type": "image", "source": {"type": "base64", "media_type": media_type,
                                                  "data": base64.standard_b64encode(image).decode()}},
-                    {"type": "text", "text": prompt},
-                ],
+                ] if image is not None else []) + [{"type": "text", "text": prompt}],
             }],
         )
         if self.effort and not self.model.startswith("claude-haiku"):
@@ -250,10 +256,10 @@ class ScreenshotAnalyzer:
     # ---- execution ------------------------------------------------------------
 
     async def analyze(
-        self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
-        hints: str = "",
+        self, image: bytes | None, media_type: str | None, note: str | None = None, correction: dict | None = None,
+        hints: str = "", link_url: str | None = None, web: bool = True,
     ) -> dict:
-        return await self.run(self.build_params(image, media_type, note, correction, hints))
+        return await self.run(self.build_params(image, media_type, note, correction, hints, link_url, web))
 
     async def run(self, params: dict) -> dict:
         """Run the identification loop in real time."""

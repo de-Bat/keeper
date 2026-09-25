@@ -135,6 +135,8 @@ struct Item: Codable, Identifiable, Equatable {
     var needsReview: Bool
     var usage: ItemUsage?
     var batchPending: Bool
+    var kind: String                   // screenshot | url
+    var sourceUrl: String?             // the shared link (kind == "url")
 
     // Local-only state
     var localImage: String?            // file name in AppGroup.images
@@ -148,6 +150,7 @@ struct Item: Codable, Identifiable, Equatable {
         case confidence, alternatives, corrected
         case confidenceReason = "confidence_reason", needsReview = "needs_review"
         case usage, batchPending = "batch_pending"
+        case kind, sourceUrl = "source_url"
     }
 
     init(localID: String, localImage: String, note: String?, createdAt: Date) {
@@ -166,7 +169,20 @@ struct Item: Codable, Identifiable, Equatable {
         corrected = false
         needsReview = false
         batchPending = false
+        kind = "screenshot"
     }
+
+    /// A link saved on this device, waiting to be sent to the server.
+    init(localID: String, link: URL, note: String?, createdAt: Date) {
+        self.init(localID: localID, localImage: "", note: note, createdAt: createdAt)
+        localImage = nil
+        kind = "url"
+        sourceUrl = link.absoluteString
+        title = (link.host ?? link.absoluteString).replacingOccurrences(of: "www.", with: "") + (link.path.count > 1 ? link.path : "")
+    }
+
+    var isLink: Bool { kind == "url" }
+    var hasScreenshot: Bool { localImage != nil || !(imageFile ?? "").isEmpty }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -194,6 +210,9 @@ struct Item: Codable, Identifiable, Equatable {
         needsReview = (try? c.decodeIfPresent(Bool.self, forKey: .needsReview)) ?? false
         usage = try? c.decodeIfPresent(ItemUsage.self, forKey: .usage)
         batchPending = (try? c.decodeIfPresent(Bool.self, forKey: .batchPending)) ?? false
+        kind = (try? c.decodeIfPresent(String.self, forKey: .kind)) ?? "screenshot"
+        sourceUrl = try? c.decodeIfPresent(String.self, forKey: .sourceUrl)
+        if imageFile?.isEmpty == true { imageFile = nil }  // links have no screenshot
         localImage = try c.decodeIfPresent(String.self, forKey: .localImage)
         pendingUpload = try c.decodeIfPresent(Bool.self, forKey: .pendingUpload) ?? false
     }
@@ -218,7 +237,7 @@ struct Item: Codable, Identifiable, Equatable {
 
     /// Lowercased, diacritic-folded text used for offline search.
     var searchBlob: String {
-        var parts = [title, subtitle, summary, note, category, sourcePlatform].compactMap { $0 }
+        var parts = [title, subtitle, summary, note, category, sourcePlatform, sourceUrl].compactMap { $0 }
         parts += tags
         parts += metadata.values.flatMap(\.searchText)
         return parts.joined(separator: " ").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)

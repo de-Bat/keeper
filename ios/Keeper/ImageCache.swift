@@ -62,8 +62,14 @@ struct ItemImage: View {
             .overlay {
                 if let image {
                     Image(uiImage: image).resizable().scaledToFill()
+                } else if item.isLink && item.category == nil {
+                    VStack(spacing: 4) {
+                        Image(systemName: "link").font(.title2)
+                        Text(URL(string: item.sourceUrl ?? "")?.host ?? "").font(.caption).lineLimit(1)
+                    }
+                    .foregroundStyle(.secondary).padding(6)
                 } else {
-                    Image(systemName: Category(rawValue: item.category ?? "")?.symbol ?? "photo")
+                    Image(systemName: Category(rawValue: item.category ?? "")?.symbol ?? (item.isLink ? "link" : "photo"))
                         .font(.largeTitle).foregroundStyle(.tertiary)
                 }
             }
@@ -85,7 +91,7 @@ struct ItemImage: View {
            let local = UIImage(contentsOfFile: AppGroup.images.appendingPathComponent(file).path) {
             return local
         }
-        if let file = item.imageFile, let api = ServerSettings.client {
+        if let file = item.imageFile, !file.isEmpty, let api = ServerSettings.client {
             return await ImageCache.shared.image(for: api.mediaRequest(file))
         }
         return nil

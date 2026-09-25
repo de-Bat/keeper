@@ -1,6 +1,9 @@
 # 📌 Keeper
 
-Save screenshots of things people recommend: a Facebook post about a TV show, an Instagram reel with a recipe, a tweet about a GitHub repo, a web page reviewing a movie. Keeper works out **what is actually being recommended**, finds the **original source**, adds **metadata for that type of thing**, and files it by **category and tags** so you can find it later.
+Self-hosted, single-user capture for things people recommend. **Share a screenshot or a link** (a Facebook post about a TV show, an Instagram reel with a recipe, a GitHub repo, an IMDb page, an article). Keeper works out **what it actually is**, finds the **original source**, adds **metadata for that type of thing**, and files it by **category and tags** so you can find it later.
+
+- **Links** are recognized from the URL and the page's structured data when possible (GitHub, IMDb, TMDB, Letterboxd, Goodreads, Spotify, app stores, and any page with schema.org data such as recipes, films, books, products and events). That takes no AI model, costs nothing, and is near-instant. Other pages get a **reader view** (main text, excerpt, author, reading time, lead image) and, if a model is configured, a text-only identification.
+- **Screenshots** are read by a vision model (Claude, or your own), helped by OCR.
 
 | Category | What Keeper finds |
 |---|---|
@@ -15,6 +18,8 @@ It also records **where you saw it** (Facebook, Instagram, web…), who posted i
 Every identification comes with a **confidence score** and, when the model isn't sure, a list of **alternatives**. If it got something wrong you can **correct it**: pick an alternative, fix the title/type/year/link, or describe it in words and let Claude look again.
 
 **Cost:** about **$0.05 per screenshot** with the default hybrid setup, and every analysis's real cost is measured and shown in the app. See [docs/COSTS.md](docs/COSTS.md). **Model and OCR choices:** [docs/MODELS.md](docs/MODELS.md).
+
+**Coming next:** text selections and notes as items, and sharing links/text straight from other apps. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **Clients:** an installable **PWA** (Add to Home Screen on iPhone) and a native **iOS app** with a Share Extension. Both work **offline** and sync when they can reach your self-hosted server.
 
@@ -31,6 +36,25 @@ screenshot ──► Claude (vision + web search) ──► identification ─�
 1. **Identify.** `keeper/analyzer.py` sends the screenshot to Claude (`claude-opus-5` by default) with the web search and web fetch tools. Claude reads the post, finds the thing being recommended, confirms it online, and returns a strict, schema-validated result: category, source platform, title, canonical URL, summary, tags, and type-specific details.
 2. **Enrich.** `keeper/enrich.py` asks authoritative sources for the facts: the GitHub API for repos, TMDB and OMDb for film and TV, Open Library for books, and the recipe page's schema.org data for recipes. For anything else it reads the page's OpenGraph tags. Each enricher is best-effort: without an API key you still get what Claude found through web search.
 3. **Store & retrieve.** `keeper/db.py` keeps items, tags, and an FTS5 full-text index over titles, summaries, tags, metadata and the screenshot's text. You can filter by category and tags and edit anything.
+
+## Saving links
+
+Paste a link into **Save link** in the web app, paste it anywhere on the page, or drop it onto the page. In the iOS app, copy the link and tap the clipboard button. Offline, links are queued like screenshots.
+
+What happens to a link, in order:
+
+1. **Clean-up.** Tracking parameters (`utm_*`, `fbclid`, `igshid`, X's `s`/`t`…) and `www.` are removed, so the same link is never saved twice. Saving a duplicate returns the existing item and adds any new tags.
+2. **Recognize it from the URL:** `github.com/owner/repo`, `imdb.com/title/tt…`, `themoviedb.org/movie|tv/…`, Letterboxd films, Goodreads books, Spotify, app stores, YouTube.
+3. **…or from the page's structured data.** schema.org JSON-LD `@type` (Recipe, Movie, TVSeries, Book, Product, Event, Restaurant, SoftwareApplication, Course, NewsArticle…) or OpenGraph `og:type`.
+4. **Enrich it** with the same sources as screenshots (GitHub stars and topics, TMDB poster and cast, recipe ingredients…).
+5. **Unrecognized pages** get a reader view (via [trafilatura](https://trafilatura.readthedocs.io/)): the main text without menus and footers, an excerpt, author, date, reading time and lead image. The full text is searchable.
+   - If a model is configured, it identifies the page from that text. That's a cheap, text-only request without web search, unless the page couldn't be read.
+   - In `ocr` mode, the reader view becomes a generic article card.
+   - Pages behind a login (many Instagram and Facebook posts) get a basic card, flagged for review.
+
+Links recognized in steps 2–3 never call a model: **$0 and about a second**.
+
+**Network safety:** Keeper fetches links you share and URLs a model read off a screenshot. To stop those requests from reaching machines on your own network, it refuses any URL (or redirect) that resolves to a private, loopback or link-local address. Set `KEEPER_ALLOW_PRIVATE_URLS=true` if you want to save pages from your LAN.
 
 ## Choosing the AI: Claude, on-prem LLM, or no LLM
 
@@ -132,6 +156,7 @@ uvicorn keeper.main:create_app --factory --host 0.0.0.0 --port 8000
 | `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL` | for `local`/`hybrid` | Your OpenAI-compatible LLM server and model |
 | `KEEPER_OCR`, `KEEPER_OCR_LANGS` | optional | `rapidocr` (default), `tesseract` (+ languages), `off` |
 | `KEEPER_ENRICH` | optional | `off` disables all online metadata lookups |
+| `KEEPER_ALLOW_PRIVATE_URLS` | optional | `true` lets Keeper fetch links on private/LAN addresses (blocked by default) |
 | `KEEPER_CLAUDE_BATCH` | optional | `true` (default): new screenshots use the 50%-off Batches API; `false`: real time |
 | `KEEPER_EFFORT`, `KEEPER_FETCH_MAX_TOKENS` | optional | Claude cost controls (defaults `medium`, `8000`) |
 | `KEEPER_LOCAL_COST_PER_HOUR`, `KEEPER_PRICING` | optional | For the usage report: your local box's running cost; price overrides |
@@ -193,7 +218,7 @@ Before running on a device:
 | Method | Path | |
 |---|---|---|
 | `GET` | `/api/health` | Reachability check (no auth) |
-| `POST` | `/api/items` | Multipart: `file` (PNG/JPEG/WebP/GIF), optional `note`, `tags` (comma-separated), `id` (client-generated, idempotent), `created_at`. Returns `202`; analysis runs in the background |
+| `POST` | `/api/items` | Multipart form with **either** `file` (PNG/JPEG/WebP/GIF screenshot) **or** `url` (a link), plus optional `note`, `tags` (comma-separated), `id` (client-generated, idempotent), `created_at`. Returns `202`; identification runs in the background. A link that is already saved returns the existing item with `"duplicate": true` |
 | `GET` | `/api/items` | `?q=` full-text, `?category=`, `?tag=` (repeatable), `?needs_review=true` |
 | `GET` / `PATCH` / `DELETE` | `/api/items/{id}` | PATCH accepts `title`, `subtitle`, `summary`, `category`, `note`, `canonical_url`, `tags` |
 | `POST` | `/api/items/{id}/reanalyze` | Run identification again |
@@ -203,7 +228,7 @@ Before running on a device:
 | `GET` | `/api/usage?days=30` | Measured cost: totals, per screenshot, share sent to Claude, per analyzer, per day |
 | `GET` | `/media/{file}` | Original screenshots |
 
-Items include `confidence` (0–100), `confidence_reason`, `alternatives`, `corrected`, `needs_review`, `batch_pending` and `usage` (`cost_usd`, `runs`, `web_searches`, `via`).
+Items include `kind` (`screenshot` or `url`), `source_url` (for links), `confidence` (0–100), `confidence_reason`, `alternatives`, `corrected`, `needs_review`, `batch_pending` and `usage` (`cost_usd`, `runs`, `web_searches`, `via`).
 
 When `KEEPER_API_TOKEN` is set, send `Authorization: Bearer <token>`.
 

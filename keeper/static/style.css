@@ -263,3 +263,15 @@ body { padding-bottom: env(safe-area-inset-bottom); -webkit-tap-highlight-color:
 .usage-panel .close { position: absolute; top: 10px; right: 12px; }
 .usage-panel h2 { padding-right: 48px; }
 .bar { max-width: 28px; }
+
+/* ---- links ---- */
+.link-form { display: flex; gap: 8px; width: min(520px, 100%); margin-top: 6px; }
+.link-form input { flex: 1; min-width: 0; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+.card .thumb.no-image { display: grid; place-items: center; background: linear-gradient(135deg, var(--surface-2), var(--accent-soft)); }
+.thumb-host { font-weight: 600; color: var(--muted); padding: 0 12px; text-align: center; word-break: break-all; }
+.shared-link a { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: 10px; background: var(--surface); text-decoration: none; font-weight: 600; word-break: break-all; }
+.shared-link small { color: var(--muted); font-weight: 400; font-size: 12px; }
+@media (max-width: 760px) {
+  .link-form { width: 100%; }
+  .detail .media .shared-link { min-width: 220px; }
+}

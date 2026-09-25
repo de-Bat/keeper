@@ -16,7 +16,7 @@ struct ItemDetailView: View {
     private static let hiddenKeys: Set<String> = [
         "screenshot_text", "sources", "confidence", "ingredients", "instructions", "imdb_rating", "rotten_tomatoes",
         "metacritic", "tmdb_rating", "stars", "rating", "rating_count", "description", "post_url", "imdb_votes", "tmdb_id",
-        "page_description", "page_title", "github_full_name", "year", "ocr_text",
+        "page_description", "page_title", "github_full_name", "year", "ocr_text", "article_text", "excerpt", "word_count",
     ]
 
     var body: some View {
@@ -110,7 +110,12 @@ struct ItemDetailView: View {
                 )) {
                     ForEach(Category.allCases) { Label($0.label, systemImage: $0.symbol).tag($0.rawValue) }
                 }
-                Button { showScreenshot = true } label: { Label("View screenshot", systemImage: "photo") }
+                if item.hasScreenshot {
+                    Button { showScreenshot = true } label: { Label("View screenshot", systemImage: "photo") }
+                }
+                if let link = item.sourceUrl.flatMap(URL.init(string:)) {
+                    Link(destination: link) { Label("Open shared link", systemImage: "link") }
+                }
                 if !item.pendingUpload {
                     Button { store.reanalyze(item.id); sync.requestSync() } label: {
                         Label("Re-analyze", systemImage: "arrow.clockwise")

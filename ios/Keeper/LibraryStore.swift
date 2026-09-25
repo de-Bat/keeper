@@ -78,6 +78,35 @@ final class LibraryStore: ObservableObject {
         return id
     }
 
+    /// Adds a link. Returns the item id (an existing one if this link is already saved).
+    @discardableResult
+    func addLink(_ url: URL, note: String? = nil) -> String {
+        let key = Self.linkKey(url.absoluteString)
+        if let existing = items.first(where: { $0.sourceUrl.map(Self.linkKey) == key }) {
+            return existing.id
+        }
+        let id = "ios-" + UUID().uuidString.lowercased()
+        let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        items.insert(Item(localID: id, link: url, note: trimmedNote?.isEmpty == false ? trimmedNote : nil, createdAt: .now), at: 0)
+        pending.append(PendingOp(itemID: id, kind: .upload))
+        save()
+        return id
+    }
+
+    private static func linkKey(_ s: String) -> String {
+        guard let u = URL(string: s) else { return s.lowercased() }
+        let host = (u.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
+        return host + (u.path.hasSuffix("/") ? String(u.path.dropLast()) : u.path).lowercased()
+    }
+
+    /// The server already had this link under another id: swap the local placeholder for it.
+    func replaceLocal(_ localID: String, with server: Item) {
+        items.removeAll { $0.id == localID }
+        pending.removeAll { $0.itemID == localID }
+        merge(server)
+        save()
+    }
+
     /// Moves screenshots saved by the share extension into the library.
     func importInbox() {
         let fm = FileManager.default

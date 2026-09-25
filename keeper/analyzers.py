@@ -144,10 +144,13 @@ class LocalLLMAnalyzer:
     def label(self) -> str:
         return f"local:{self.model}"
 
-    async def analyze(self, image: bytes, media_type: str, note: str | None = None,
-                      correction: dict | None = None, hints: str = "") -> dict:
+    async def analyze(self, image: bytes | None, media_type: str | None, note: str | None = None,
+                      correction: dict | None = None, hints: str = "", link_url: str | None = None, web: bool = True) -> dict:
         prompt = "Identify what this screenshot is recommending and catalogue it."
-        if not self.vision:
+        if image is None:
+            prompt = (f"The user shared a link, not a screenshot: {link_url}\n"
+                      "Identify what it is (or what it recommends) and catalogue it, using the page content below.")
+        elif not self.vision:
             prompt = "Identify what this screenshot is recommending, using only the OCR text below, and catalogue it."
         if note:
             prompt += f"\n\nThe user added this note when saving it: {note}"
@@ -158,7 +161,7 @@ class LocalLLMAnalyzer:
                    ". confidence is an integer 0-100. details has these keys: " + ", ".join(DETAIL_KEYS) + ".")
 
         content: list[dict] = [{"type": "text", "text": prompt}]
-        if self.vision:
+        if self.vision and image is not None:
             data, mt = prepare_image(image, media_type)
             content.append({"type": "image_url", "image_url": {"url": f"data:{mt};base64,{base64.b64encode(data).decode()}"}})
         body = {
@@ -283,13 +286,17 @@ class AnalyzerRouter:
             self.local = LocalLLMAnalyzer(settings, http)
         log.info("Analyzer: %s (OCR: %s, Claude batch: %s)", self.mode, settings.ocr_engine, self.batch)
 
-    async def analyze(self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
-                      interactive: bool = False) -> dict:
-        """`interactive` requests (the user is waiting, e.g. a correction) never go through a batch."""
+    async def analyze(self, image: bytes | None, media_type: str | None, note: str | None = None,
+                      correction: dict | None = None, interactive: bool = False,
+                      link_url: str | None = None, page_hints: str = "", web: bool = True) -> dict:
+        """Identify a screenshot, or a shared link when `image` is None (then `page_hints` carries
+        the page's reader-view text). `interactive` requests (the user is waiting, e.g. a
+        correction) never go through a batch."""
         started = time.monotonic()
-        ocr = await self.ocr.read(image)
+        ocr = await self.ocr.read(image) if image is not None else None
         signals = extract_signals(ocr) if ocr and ocr.lines else None
-        hints = hints_prompt(ocr, signals)
+        hints = hints_prompt(ocr, signals) + page_hints
+        link = {"link_url": link_url, "web": web} if link_url else {}
         context: dict[str, Any] = {"used": [], "runs": [], "ocr_text": ocr.text if ocr and ocr.lines else ""}
         if ocr and ocr.lines:
             context["used"].append("ocr")
@@ -298,9 +305,9 @@ class AnalyzerRouter:
 
         async def claude_step() -> dict:
             if self.batch and not interactive:
-                raise Deferred(self.claude.build_params(image, media_type, note, correction, hints), context)
+                raise Deferred(self.claude.build_params(image, media_type, note, correction, hints, **link), context)
             try:
-                result = await self.claude.analyze(image, media_type, note=note, correction=correction, hints=hints)
+                result = await self.claude.analyze(image, media_type, note=note, correction=correction, hints=hints, **link)
             except AnalysisError as e:
                 e.runs = context["runs"] + e.runs
                 raise
@@ -314,7 +321,7 @@ class AnalyzerRouter:
             result = await claude_step()
         elif self.mode == "local":
             try:
-                result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints)
+                result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints, **link)
             except AnalysisError as e:
                 e.runs = context["runs"] + e.runs
                 raise
@@ -323,7 +330,7 @@ class AnalyzerRouter:
             result = None
             if time.monotonic() >= self._local_down_until:
                 try:
-                    result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints)
+                    result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints, **link)
                     context["used"].append(self.local.label)
                 except AnalysisError as e:
                     context["runs"] += e.runs

@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS items (
     confidence      INTEGER,                -- 0-100, how sure the model is; 100 once the user corrects it
     confidence_reason TEXT,
     alternatives    TEXT NOT NULL DEFAULT '[]',  -- other things it might be: [{title, category, year, canonical_url, why}]
-    corrected       INTEGER NOT NULL DEFAULT 0
+    corrected       INTEGER NOT NULL DEFAULT 0,
+    kind            TEXT NOT NULL DEFAULT 'screenshot',  -- screenshot | url
+    source_url      TEXT                    -- the link that was shared (kind = url), normalized
 );
 CREATE INDEX IF NOT EXISTS items_category ON items(category);
 CREATE INDEX IF NOT EXISTS items_created ON items(created_at);
@@ -97,6 +99,8 @@ MIGRATIONS = {
     "confidence_reason": "TEXT",
     "alternatives": "TEXT NOT NULL DEFAULT '[]'",
     "corrected": "INTEGER NOT NULL DEFAULT 0",
+    "kind": "TEXT NOT NULL DEFAULT 'screenshot'",
+    "source_url": "TEXT",
 }
 # Below this confidence an identification is flagged for the user to check.
 REVIEW_THRESHOLD = 60
@@ -133,6 +137,7 @@ class Database:
             for column, ddl in MIGRATIONS.items():
                 if column not in existing:
                     self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} {ddl}")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS items_source_url ON items(source_url)")
 
     # ---- items -------------------------------------------------------------
 
@@ -143,6 +148,8 @@ class Database:
         tags: list[str] | None = None,
         item_id: str | None = None,
         created_at: str | None = None,
+        kind: str = "screenshot",
+        source_url: str | None = None,
     ) -> dict:
         """Create an item. Clients may supply the id (so offline uploads can be retried safely)
         and the original capture time."""
@@ -150,8 +157,9 @@ class Database:
         ts = now()
         with self.conn:
             self.conn.execute(
-                "INSERT INTO items (id, created_at, updated_at, status, image_file, note) VALUES (?, ?, ?, 'processing', ?, ?)",
-                (item_id, created_at or ts, ts, image_file, note),
+                "INSERT INTO items (id, created_at, updated_at, status, image_file, note, kind, source_url) "
+                "VALUES (?, ?, ?, 'processing', ?, ?, ?, ?)",
+                (item_id, created_at or ts, ts, image_file, note, kind, source_url),
             )
             self.conn.execute("DELETE FROM tombstones WHERE id = ?", (item_id,))
         if tags:
@@ -218,6 +226,10 @@ class Database:
         sql += f" ORDER BY {order} LIMIT ? OFFSET ?"
         rows = self.conn.execute(sql, (*params, limit, offset)).fetchall()
         return [self._row_to_item(r) for r in rows]
+
+    def find_by_source_url(self, url: str) -> dict | None:
+        row = self.conn.execute("SELECT id FROM items WHERE source_url = ? ORDER BY created_at LIMIT 1", (url,)).fetchone()
+        return self.get_item(row["id"]) if row else None
 
     def is_deleted(self, item_id: str) -> bool:
         return self.conn.execute("SELECT 1 FROM tombstones WHERE id = ?", (item_id,)).fetchone() is not None
@@ -379,7 +391,7 @@ class Database:
         if not row:
             return
         tags = " ".join(self.get_tags(item_id))
-        body_parts = [row["subtitle"], row["note"], row["category"], row["source_platform"], row["canonical_url"]]
+        body_parts = [row["subtitle"], row["note"], row["category"], row["source_platform"], row["canonical_url"], row["source_url"]]
         try:
             meta = json.loads(row["metadata"] or "{}")
             body_parts.extend(_flatten_text(meta))

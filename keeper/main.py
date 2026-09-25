@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from .analyzer import CATEGORIES, AnalysisError
 from .analyzers import AnalyzerRouter
 from .batch import BatchWorker
+from .links import URL_TOO_LONG, normalize_url
 from .config import Settings
 from .db import Database
 from .pipeline import Pipeline
@@ -121,7 +122,8 @@ def create_app(
     @app.post("/api/items", status_code=202)
     async def upload(
         background: BackgroundTasks,
-        file: UploadFile = File(...),
+        file: UploadFile | None = File(None),
+        url: str | None = Form(None, description="Capture a link instead of a screenshot"),
         note: str | None = Form(None),
         tags: str | None = Form(None, description="Comma-separated tags to add"),
         id: str | None = Form(None, description="Client-generated id; re-sending the same id is a no-op"),
@@ -135,6 +137,10 @@ def create_app(
                 return existing
             if db.is_deleted(id):
                 raise HTTPException(410, "This item was deleted")
+        if (file is None) == (not url):
+            raise HTTPException(422, "Send either a screenshot (file) or a link (url)")
+        if url:
+            return capture_url(url, id, note, tags, created_at, background)
         media_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
         if media_type not in IMAGE_TYPES:
             raise HTTPException(415, f"Unsupported image type {media_type!r}; use PNG, JPEG, WebP or GIF")
@@ -148,6 +154,29 @@ def create_app(
         item = db.create_item(
             name, note=note or None, tags=[t for t in (tags or "").split(",") if t.strip()],
             item_id=id, created_at=_normalize_time(created_at),
+        )
+        background.add_task(state["pipeline"].process, item["id"])
+        return item
+
+    def capture_url(url: str, item_id: str | None, note: str | None, tags: str | None, created_at: str | None,
+                    background: BackgroundTasks) -> dict:
+        url = url.strip()
+        if len(url) > URL_TOO_LONG:
+            raise HTTPException(422, "URL is too long")
+        normalized = normalize_url(url)
+        if not re.match(r"^https?://[^/\s]+\.[^/\s]+", normalized):
+            raise HTTPException(422, "That doesn't look like a web link (http or https)")
+        existing = db.find_by_source_url(normalized)
+        if existing:  # already saved: don't identify (or pay for) it twice
+            new_tags = [t for t in (tags or "").split(",") if t.strip()]
+            if new_tags:
+                db.add_tags(existing["id"], new_tags)
+            if note and not existing.get("note"):
+                db.update_item(existing["id"], note=note)
+            return {**db.get_item(existing["id"]), "duplicate": True}
+        item = db.create_item(
+            "", note=note or None, tags=[t for t in (tags or "").split(",") if t.strip()],
+            item_id=item_id, created_at=_normalize_time(created_at), kind="url", source_url=normalized,
         )
         background.add_task(state["pipeline"].process, item["id"])
         return item
@@ -206,7 +235,8 @@ def create_app(
     def delete_item(item_id: str):
         item = get_or_404(item_id)
         db.delete_item(item_id)
-        (settings.uploads_dir / item["image_file"]).unlink(missing_ok=True)
+        if item["image_file"]:
+            (settings.uploads_dir / item["image_file"]).unlink(missing_ok=True)
 
     @app.get("/api/usage")
     def usage(days: int = Query(30, ge=1, le=366)):

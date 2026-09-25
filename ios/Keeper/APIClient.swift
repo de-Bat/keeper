@@ -137,6 +137,25 @@ struct APIClient {
         return try await send(req)
     }
 
+    /// Save a shared link. The server may answer with an existing item if the link was saved before.
+    func captureLink(item: Item) async throws -> Item {
+        let boundary = "keeper-\(UUID().uuidString)"
+        var body = Data()
+        func field(_ name: String, _ value: String) {
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
+        }
+        field("url", item.sourceUrl ?? "")
+        field("id", item.id)
+        field("created_at", item.createdAt)
+        if let note = item.note, !note.isEmpty { field("note", note) }
+        if !item.tags.isEmpty { field("tags", item.tags.joined(separator: ",")) }
+        body.append("--\(boundary)--\r\n")
+        var req = request("api/items", method: "POST", timeout: 60)
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        return try await send(req)
+    }
+
     func update(id: String, patch: ItemPatch) async throws -> Item {
         var req = request("api/items/\(id)", method: "PATCH")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")

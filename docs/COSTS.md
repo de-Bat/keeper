@@ -13,6 +13,8 @@ With the defaults (hybrid mode, Claude Opus 5, batch processing, effort `medium`
 | **`hybrid`** (default: local model first, Claude only when it isn't sure) | **~$0.05** average, if ~25% go to Claude | **~$15** |
 | `claude` (every screenshot to Claude, batched) | ~$0.06 easy · **~$0.21 typical** · up to ~$0.70 | ~$20–65 |
 | `claude` in real time (`KEEPER_CLAUDE_BATCH=false`) | ~$0.10 easy · ~$0.40 typical · up to ~$1.30 | ~$35–120 |
+| **Saved link, recognized** (GitHub, IMDb, TMDB, schema.org pages…) | **$0**: no model call | $0 |
+| Saved link, unrecognized → Claude reads the page text (no web search, batched) | ~$0.03 (~$0.05 in real time) | – |
 | `local` (your own model only) | ~$0.0002–0.001 in electricity | < $1 |
 | `ocr` (no model) | ~$0 (about 1 s of CPU) | $0 |
 
@@ -62,6 +64,18 @@ web searches   3 × $0.01                                 = $0.030
                                                           ------
                                                           ≈ $0.21
 ```
+
+### Links cost less than screenshots
+
+A saved link that Keeper recognizes (from the URL or the page's structured data) never calls a model.
+
+For other pages, the model gets the reader-view text instead of an image, and no web tools. The request is:
+- ~3k tokens of page text (capped at 12,000 characters)
+- the ~1.8k-token result form
+- the ~0.4k-token instructions
+- ~1k output tokens
+
+That's about $0.05 in real time and $0.03 batched. Web search is enabled only when the page can't be read (e.g. a login wall); then the cost is closer to a screenshot's.
 
 ## Cost controls (on by default)
 

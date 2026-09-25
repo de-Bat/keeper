@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
@@ -15,7 +16,9 @@ from urllib.parse import urljoin
 
 import httpx
 
+from . import readability
 from .config import Settings
+from .fetch import MAX_BYTES, BlockedURL, safe_get
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +130,9 @@ async def enrich_screen(analysis: dict, settings: Settings, http: httpx.AsyncCli
         base = "https://api.themoviedb.org/3"
         kind = "tv" if is_tv else "movie"
         tmdb_id = None
-        if imdb_id:
+        if analysis.get("_tmdb"):  # a shared themoviedb.org link
+            kind, tmdb_id = analysis["_tmdb"]
+        if imdb_id and not tmdb_id:
             r = await http.get(f"{base}/find/{imdb_id}", headers=headers, params={**params, "external_source": "imdb_id"})
             if r.status_code == 200:
                 data = r.json()
@@ -305,25 +310,42 @@ class Page:
     meta: dict[str, str]
     ld: list[dict]
     title: str
+    html: str = ""
+
+
+_PAGE_CACHE: dict[str, tuple[float, Page | None]] = {}
+PAGE_CACHE_SECONDS = 120
 
 
 async def fetch_page(url: str, http: httpx.AsyncClient) -> Page | None:
+    hit = _PAGE_CACHE.get(url)
+    if hit and time.monotonic() - hit[0] < PAGE_CACHE_SECONDS:
+        return hit[1]
+    page = await _fetch_page(url, http)
+    if len(_PAGE_CACHE) > 200:
+        _PAGE_CACHE.clear()
+    _PAGE_CACHE[url] = (time.monotonic(), page)
+    return page
+
+
+async def _fetch_page(url: str, http: httpx.AsyncClient) -> Page | None:
     try:
-        r = await http.get(url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html"}, follow_redirects=True)
-    except httpx.HTTPError as e:
+        r = await safe_get(http, url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml"})
+    except (httpx.HTTPError, BlockedURL) as e:
         log.info("Fetching %s failed: %s", url, e)
         return None
     if r.status_code != 200 or "html" not in r.headers.get("content-type", "html"):
         return None
+    html = r.text[:MAX_BYTES]
     p = _PageParser()
-    p.feed(r.text[:2_000_000])
+    p.feed(html)
     ld: list[dict] = []
     for raw in p.ld_json:
         try:
             ld.extend(_walk_ld(json.loads(raw)))
         except json.JSONDecodeError:
             continue
-    return Page(url=str(r.url), meta=p.meta, ld=ld, title=p.title.strip())
+    return Page(url=str(r.url), meta=p.meta, ld=ld, title=p.title.strip(), html=html)
 
 
 def _walk_ld(node: Any) -> list[dict]:
@@ -465,7 +487,30 @@ async def enrich_web(analysis: dict, settings: Settings, http: httpx.AsyncClient
         found = recipe_from_page(page)
         if found:
             return found
-    return opengraph_from_page(page)
+    return with_readability(opengraph_from_page(page), page)
+
+
+def with_readability(e: Enrichment, page: Page) -> Enrichment:
+    """Add the page's main content (reader view): excerpt, byline, reading time, full text."""
+    article = readability.extract(page.html, page.url)
+    if not article:
+        return e
+    m = e.metadata
+    m["author"] = m.get("author") or article.author
+    m["site_name"] = m.get("site_name") or article.site_name
+    m["published_date"] = m.get("published_date") or article.published_date
+    m["page_title"] = m.get("page_title") or article.title
+    if article.excerpt:
+        m["excerpt"] = article.excerpt
+    if article.word_count:
+        m["word_count"] = article.word_count
+        m["reading_time"] = f"{article.reading_minutes} min read"
+        m["article_text"] = article.text  # hidden in the UI; makes the article searchable
+    if article.language:
+        m["language"] = article.language
+    e.image_url = e.image_url or article.image
+    e.source = "opengraph+readability"
+    return e
 
 
 # ---------------------------------------------------------------------------

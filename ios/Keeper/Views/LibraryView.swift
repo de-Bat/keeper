@@ -43,8 +43,8 @@ struct LibraryView: View {
                     Button { showSettings = true } label: { SyncStatusIcon() }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { pasteScreenshot() } label: { Image(systemName: "doc.on.clipboard") }
-                        .accessibilityLabel("Paste screenshot")
+                    Button { pasteFromClipboard() } label: { Image(systemName: "doc.on.clipboard") }
+                        .accessibilityLabel("Paste a screenshot or link")
                     PhotosPicker(selection: $picked, maxSelectionCount: 20, matching: .images) {
                         Image(systemName: "plus")
                     }
@@ -91,7 +91,7 @@ struct LibraryView: View {
             Label(store.items.isEmpty ? "Nothing saved yet" : "No matches", systemImage: "pin")
         } description: {
             Text(store.items.isEmpty
-                 ? "Share a screenshot to Keeper from Photos or right after taking it, or tap + to pick one."
+                 ? "Share a screenshot to Keeper from Photos or right after taking it, tap + to pick one, or copy a link and tap the clipboard."
                  : "Try a different search or filter.")
         }
         .padding(.top, 60)
@@ -112,14 +112,27 @@ struct LibraryView: View {
         }
     }
 
-    private func pasteScreenshot() {
-        guard let image = UIPasteboard.general.image, let data = image.pngData() else {
-            flash("No image on the clipboard")
+    /// Paste a screenshot, or a link copied from Safari, X, Instagram ("Copy link"), etc.
+    private func pasteFromClipboard() {
+        let board = UIPasteboard.general
+        if board.hasImages, let data = board.image?.pngData() {
+            store.addScreenshot(data)
+            flash("Screenshot saved")
+        } else if let url = board.url ?? board.string.flatMap(Self.link(from:)) {
+            store.addLink(url)
+            flash("Link saved")
+        } else {
+            flash("Copy a screenshot or a link first")
             return
         }
-        store.addScreenshot(data)
-        flash("Screenshot saved")
         sync.requestSync()
+    }
+
+    private static func link(from text: String) -> URL? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.contains(" "), trimmed.contains(".") else { return nil }
+        let url = URL(string: trimmed.contains("://") ? trimmed : "https://" + trimmed)
+        return url?.scheme?.hasPrefix("http") == true && url?.host != nil ? url : nil
     }
 
     private func flash(_ text: String) {

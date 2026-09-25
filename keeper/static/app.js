@@ -16,6 +16,7 @@ const WIDE_CATEGORIES = new Set(["github_repo", "article", "video", "product", "
 
 // Metadata keys shown elsewhere in the detail view (or not useful to show).
 const HIDDEN_META = new Set([
+  "article_text", "excerpt", "word_count", "page_description",
   "screenshot_text", "sources", "confidence", "ingredients", "instructions", "imdb_rating", "rotten_tomatoes",
   "metacritic", "tmdb_rating", "stars", "rating", "rating_count", "description", "post_url", "imdb_votes", "tmdb_id",
   "page_description", "page_title", "github_full_name", "year", "ocr_text",
@@ -206,6 +207,37 @@ async function addScreenshots(files, note) {
   requestSync();
 }
 
+// Save a link. Works offline too: it's queued and identified when the server is reachable.
+async function addLink(raw, note) {
+  let url = (raw || "").trim();
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) url = "https://" + url;
+  let parsed;
+  try { parsed = new URL(url); } catch { return toast("That doesn't look like a link."); }
+  if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname.includes(".")) return toast("That doesn't look like a web link.");
+  const existing = [...state.items.values()].find((i) => i.source_url && sameLink(i.source_url, url));
+  if (existing) { toast("Already saved"); return renderDetail(existing); }
+  const now = new Date().toISOString();
+  const id = newId();
+  await putItem({
+    id, kind: "url", source_url: url, created_at: now, updated_at: now, status: "queued", error: null,
+    note: note || null, category: null, title: parsed.hostname.replace(/^www\./, "") + (parsed.pathname.length > 1 ? parsed.pathname : ""),
+    subtitle: null, summary: null, metadata: {}, links: [], tags: [], pending_upload: true, image_file: "",
+  });
+  await enqueue({ type: "upload", id });
+  toast(navigator.onLine ? "Link saved — looking it up…" : "Link saved offline — will be looked up when you're back online");
+  render();
+  requestSync();
+}
+
+function sameLink(a, b) {
+  const norm = (u) => { try { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + x.pathname.replace(/\/$/, "")).toLowerCase(); } catch { return u; } };
+  return norm(a) === norm(b);
+}
+
+function looksLikeUrl(text) {
+  return /^(https?:\/\/)?[\w-]+(\.[\w-]+)+(\/\S*)?$/i.test((text || "").trim());
+}
+
 async function editItem(id, patch) {
   const item = state.items.get(id);
   if (!item) return;
@@ -334,16 +366,18 @@ async function pushOps() {
     try {
       if (op.type === "upload") {
         const item = state.items.get(op.id);
-        const blob = await db.get("blobs", op.id);
-        if (!item || !blob) { await dropOp(op); continue; }
+        const blob = item?.kind === "url" ? null : await db.get("blobs", op.id);
+        if (!item || (item.kind !== "url" && !blob)) { await dropOp(op); continue; }
         const fd = new FormData();
-        fd.append("file", blob, item.filename || `${op.id}.png`);
+        if (item.kind === "url") fd.append("url", item.source_url);
+        else fd.append("file", blob, item.filename || `${op.id}.png`);
         fd.append("id", item.id);
         fd.append("created_at", item.created_at);
         if (item.note) fd.append("note", item.note);
         if (item.tags?.length) fd.append("tags", item.tags.join(","));
         const saved = await api("/api/items", { method: "POST", body: fd, timeout: 120000 });
         await dropOp(op);
+        if (saved.id !== op.id) await removeItem(op.id);  // the link was already saved (maybe from another device)
         await mergeServerItem(saved);
       } else if (op.type === "patch") {
         const saved = await api(`/api/items/${encodeURIComponent(op.id)}`, {
@@ -410,6 +444,9 @@ function imageFor(item) {
 function screenshotFor(item) {
   return blobUrls.get(item.id) || (item.image_file ? `/media/${encodeURIComponent(item.image_file)}` : null);
 }
+function hostOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
+}
 
 function searchBlob(item) {
   const parts = [item.title, item.subtitle, item.summary, item.note, item.category, item.source_platform, ...(item.tags || [])];
@@ -446,6 +483,7 @@ function cardFacts(item) {
   if (m.stars != null) facts.push(`★ ${Number(m.stars).toLocaleString()}`);
   if (m.programming_language) facts.push(m.programming_language);
   if (m.total_time) facts.push(`⏱ ${m.total_time}`);
+  if (m.reading_time) facts.push(`📖 ${m.reading_time.replace(" read", "")}`);
   if (m.rating && item.category === "recipe") facts.push(`⭐ ${m.rating}`);
   if (m.year && !["github_repo", "recipe"].includes(item.category)) facts.push(m.year);
   return facts.slice(0, 4);
@@ -541,7 +579,8 @@ function renderGrid() {
     const badge = item.status === "error" ? "⚠ Failed" : CATEGORY_LABELS[item.category] || (item.status === "queued" ? "⏳ Queued" : item.status === "processing" ? "…" : "📌");
     return `
       <article class="card ${wide ? "wide" : ""} ${esc(item.status)}" data-id="${esc(item.id)}">
-        <div class="thumb" ${img ? `style="background-image:url('${esc(img)}')"` : ""}><span class="badge">${esc(badge)}</span>${
+        <div class="thumb ${img ? "" : "no-image"}" ${img ? `style="background-image:url('${esc(img)}')"` : ""}>${
+          !img && item.kind === "url" ? `<span class="thumb-host">🔗 ${esc(hostOf(item.source_url))}</span>` : ""}<span class="badge">${esc(badge)}</span>${
           item.needs_review ? `<span class="badge warn" title="${esc(item.confidence_reason || "")}">Not sure? ${esc(item.confidence)}%</span>` : ""}</div>
         <div class="body">
           <div class="title">${esc(cardTitle(item))}</div>
@@ -612,7 +651,7 @@ function scoresHtml(m) {
 
 function statusHtml(item) {
   if (item.status === "error") return `<div class="error-box">Analysis failed: ${esc(item.error)}</div>`;
-  if (item.pending_upload) return `<div class="meta-line">⏳ Saved on this device. It will be uploaded and identified when the server is reachable.</div>`;
+  if (item.pending_upload) return `<div class="meta-line">⏳ Saved on this device. It will be ${item.kind === "url" ? "looked up" : "uploaded and identified"} when the server is reachable.</div>`;
   if (item.batch_pending) return `<div class="meta-line">⏳ Queued for Claude batch processing (half price). Usually done within minutes to an hour, at most 24 h.</div>`;
   if (item.status === "processing") return `<div class="meta-line">Analyzing… this usually takes 20–60 seconds.</div>`;
   if (hasPendingOps(item.id)) return `<div class="meta-line">⟳ Changes waiting to sync</div>`;
@@ -688,6 +727,7 @@ function renderDetail(item) {
       <div class="media">
         ${poster ? `<a href="${esc(canonical || poster)}" target="_blank" rel="noopener"><img src="${esc(poster)}" alt="" referrerpolicy="no-referrer"></a>` : ""}
         ${shot ? `<div><div class="shot-label">Your screenshot</div><a href="${esc(shot)}" target="_blank"><img src="${esc(shot)}" alt="Screenshot"></a></div>` : ""}
+        ${item.kind === "url" && safeUrl(item.source_url) ? `<div class="shared-link"><div class="shot-label">Shared link</div><a href="${esc(safeUrl(item.source_url))}" target="_blank" rel="noopener">🔗 ${esc(hostOf(item.source_url))}<small>${esc(item.source_url)}</small></a></div>` : ""}
       </div>
       <div class="info">
         <button class="btn close" data-action="close" aria-label="Close">✕</button>
@@ -745,14 +785,27 @@ $("#file-input").addEventListener("change", (e) => {
 document.addEventListener("paste", (e) => {
   if (e.target.matches("input, textarea")) return;
   const files = [...(e.clipboardData?.files || [])];
-  if (files.length) { e.preventDefault(); addScreenshots(files, $("#note").value.trim()); $("#note").value = ""; }
+  if (files.length) { e.preventDefault(); addScreenshots(files, $("#note").value.trim()); $("#note").value = ""; return; }
+  const text = e.clipboardData?.getData("text/plain");
+  if (looksLikeUrl(text)) { e.preventDefault(); addLink(text, $("#note").value.trim()); $("#note").value = ""; }
+});
+
+$("#link-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const value = $("#link-input").value;
+  if (!value.trim()) return;
+  addLink(value, $("#note").value.trim());
+  $("#link-input").value = "";
+  $("#note").value = "";
 });
 
 const dz = $("#dropzone");
 ["dragenter", "dragover"].forEach((ev) => document.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("over"); }));
 ["dragleave", "drop"].forEach((ev) => document.addEventListener(ev, (e) => { e.preventDefault(); if (ev === "drop" || !e.relatedTarget) dz.classList.remove("over"); }));
 document.addEventListener("drop", (e) => {
-  if (e.dataTransfer?.files?.length) { addScreenshots(e.dataTransfer.files, $("#note").value.trim()); $("#note").value = ""; }
+  if (e.dataTransfer?.files?.length) { addScreenshots(e.dataTransfer.files, $("#note").value.trim()); $("#note").value = ""; return; }
+  const link = (e.dataTransfer?.getData("text/uri-list") || e.dataTransfer?.getData("text/plain") || "").split("\n")[0];
+  if (looksLikeUrl(link)) { addLink(link, $("#note").value.trim()); $("#note").value = ""; }
 });
 
 let searchTimer;

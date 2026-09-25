@@ -85,6 +85,13 @@ final class SyncEngine: ObservableObject {
         while let op = store.pending.first {
             do {
                 switch op.kind {
+                case .upload where store.item(op.itemID)?.isLink == true:
+                    let saved = try await api.captureLink(item: store.item(op.itemID)!)
+                    if saved.id != op.itemID {
+                        store.replaceLocal(op.itemID, with: saved)
+                    } else {
+                        store.completeOp(op, result: saved)
+                    }
                 case .upload:
                     guard let item = store.item(op.itemID), let file = item.localImage,
                           let data = try? Data(contentsOf: AppGroup.images.appendingPathComponent(file)) else {
