@@ -451,8 +451,50 @@ function cardFacts(item) {
   return facts.slice(0, 4);
 }
 
+function formatUsd(v) {
+  if (!v) return "$0";
+  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(v < 1 ? 3 : 2)}`;
+}
+
+async function showUsage() {
+  const dlg = $("#detail");
+  dlg.dataset.id = "";
+  dlg.innerHTML = `<div class="usage-panel"><button class="btn close" data-action="close" aria-label="Close">✕</button><h2>Usage & cost</h2><p class="meta-line">Loading…</p></div>`;
+  if (!dlg.open) dlg.showModal();
+  let r;
+  try { r = await api("/api/usage?days=30"); } catch (e) {
+    dlg.querySelector(".meta-line").textContent = `Needs a connection to the server (${e.message}).`;
+    return;
+  }
+  const t = r.totals, c = r.config;
+  const max = Math.max(...r.by_day.map((d) => d.cost_usd), 0.0001);
+  dlg.innerHTML = `
+    <div class="usage-panel">
+      <button class="btn close" data-action="close" aria-label="Close">✕</button>
+      <h2>Usage & cost <span class="meta-line">last ${r.period_days} days</span></h2>
+      <div class="scores">
+        <div class="score"><b>${esc(formatUsd(t.cost_usd))}</b><small>total</small></div>
+        <div class="score"><b>${esc(formatUsd(r.per_screenshot_usd))}</b><small>per screenshot</small></div>
+        <div class="score"><b>${t.screenshots}</b><small>screenshots</small></div>
+        <div class="score"><b>${esc(formatUsd(r.projected_30d_usd))}</b><small>projected / 30 days</small></div>
+        <div class="score"><b>${Math.round(r.claude_share * 100)}%</b><small>sent to Claude</small></div>
+      </div>
+      <h4>By analyzer</h4>
+      <table class="usage-table"><thead><tr><th>Analyzer</th><th>Runs</th><th>Avg</th><th>Total</th><th>Tokens in / out</th><th>Searches</th><th>Avg time</th></tr></thead><tbody>
+        ${r.by_analyzer.map((a) => `<tr><td>${esc(a.analyzer)}${a.model ? ` <span class="meta-line">${esc(a.model)}</span>` : ""} <span class="meta-line">${esc(a.mode || "")}</span></td>
+          <td>${a.runs}${a.failures ? ` <span class="meta-line">(${a.failures} failed)</span>` : ""}</td><td>${esc(formatUsd(a.avg_cost_usd))}</td><td>${esc(formatUsd(a.cost_usd))}</td>
+          <td>${(a.input_tokens || 0).toLocaleString()} / ${(a.output_tokens || 0).toLocaleString()}</td><td>${a.web_searches || 0}</td>
+          <td>${a.avg_duration_ms ? (a.avg_duration_ms / 1000).toFixed(1) + " s" : "—"}</td></tr>`).join("") || `<tr><td colspan="7" class="meta-line">No analyses yet.</td></tr>`}
+      </tbody></table>
+      ${r.by_day.length ? `<h4>Per day</h4><div class="bars">${r.by_day.map((d) => `
+        <div class="bar" title="${esc(d.day)}: ${esc(formatUsd(d.cost_usd))}, ${d.screenshots} screenshot(s)"><span style="height:${Math.max(3, d.cost_usd / max * 100)}%"></span></div>`).join("")}</div>` : ""}
+      <p class="meta-line">Settings: ${esc(c.analyzer)} · ${esc(c.claude_model)} · effort ${esc(c.effort)} · batch ${c.claude_batch ? "on" : "off"} · fetch cap ${c.fetch_max_tokens ? c.fetch_max_tokens.toLocaleString() + " tokens" : "off"}${c.analyzer === "hybrid" ? ` · escalate below ${c.escalate_below}%` : ""}. Costs use list prices.</p>
+    </div>`;
+}
+
 function cardTitle(item) {
   if (item.title) return item.title;
+  if (item.batch_pending) return "Queued for analysis (batch)";
   return { queued: "Waiting to upload", processing: "Analyzing screenshot…", error: "Couldn't identify — open to retry" }[item.status] || "Untitled";
 }
 
@@ -461,7 +503,7 @@ function render() {
   renderGrid();
   renderSyncStatus();
   const dlg = $("#detail");
-  if (dlg.open) {
+  if (dlg.open && dlg.dataset.id) {  // item details (the usage panel has no id and doesn't re-render)
     const item = state.items.get(dlg.dataset.id);
     if (item) renderDetail(item); else dlg.close();
   }
@@ -571,6 +613,7 @@ function scoresHtml(m) {
 function statusHtml(item) {
   if (item.status === "error") return `<div class="error-box">Analysis failed: ${esc(item.error)}</div>`;
   if (item.pending_upload) return `<div class="meta-line">⏳ Saved on this device. It will be uploaded and identified when the server is reachable.</div>`;
+  if (item.batch_pending) return `<div class="meta-line">⏳ Queued for Claude batch processing (half price). Usually done within minutes to an hour, at most 24 h.</div>`;
   if (item.status === "processing") return `<div class="meta-line">Analyzing… this usually takes 20–60 seconds.</div>`;
   if (hasPendingOps(item.id)) return `<div class="meta-line">⟳ Changes waiting to sync</div>`;
   return "";
@@ -681,7 +724,8 @@ function renderDetail(item) {
           </select>
           ${item.pending_upload ? "" : `<button class="btn" data-action="reanalyze">↻ Re-analyze</button>`}
           <button class="btn danger" data-action="delete">Delete</button>
-          ${m.sources ? `<span class="meta-line" style="margin-left:auto">via ${esc(m.sources.join(", "))}</span>` : ""}
+          <span class="meta-line" style="margin-left:auto">${m.sources ? `via ${esc(m.sources.join(" → "))}` : ""}${
+            item.usage?.runs ? ` · ${esc(formatUsd(item.usage.cost_usd))}${item.usage.web_searches ? ` · ${item.usage.web_searches} search${item.usage.web_searches > 1 ? "es" : ""}` : ""}` : ""}</span>
         </div>
       </div>
     </div>`;
@@ -763,6 +807,7 @@ document.addEventListener("click", async (e) => {
         $("#detail").close();
         return deleteItem(id);
       case "token": return askToken();
+      case "usage": return showUsage();
       case "sync": return requestSync();
       case "dismiss-install":
         try { localStorage.setItem("keeper.installHintDismissed", "1"); } catch {}

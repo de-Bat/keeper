@@ -10,6 +10,8 @@ struct SettingsView: View {
     @State private var testResult: (ok: Bool, message: String)?
     @State private var testing = false
     @State private var confirmReset = false
+    @State private var usage: UsageReport?
+    @State private var usageError: String?
 
     var body: some View {
         NavigationStack {
@@ -52,11 +54,34 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    if let usage {
+                        LabeledContent("Total", value: formatUSD(usage.totals.costUsd))
+                        LabeledContent("Per screenshot", value: formatUSD(usage.perScreenshotUsd))
+                        LabeledContent("Screenshots", value: "\(usage.totals.screenshots)")
+                        LabeledContent("Projected / 30 days", value: formatUSD(usage.projected30dUsd))
+                        LabeledContent("Sent to Claude", value: "\(Int((usage.claudeShare * 100).rounded()))%")
+                        ForEach(usage.byAnalyzer) { a in
+                            LabeledContent("\(a.analyzer) · \(a.mode ?? "")", value: "\(a.runs) × \(formatUSD(a.avgCostUsd ?? 0))")
+                                .font(.footnote)
+                        }
+                    } else if let usageError {
+                        Text(usageError).font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                    }
+                } header: {
+                    Text("Usage & cost · last 30 days")
+                } footer: {
+                    Text("Measured on your server from real token and search usage, at list prices.")
+                }
+
+                Section {
                     Button("Re-download library", role: .destructive) { confirmReset = true }
                 } footer: {
                     Text("Clears the offline copy and downloads everything from the server again. Changes waiting to sync are kept.")
                 }
             }
+            .task { await loadUsage() }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -83,6 +108,11 @@ struct SettingsView: View {
         case .offline: return "Server unreachable"
         case .failed(let message): return message
         }
+    }
+
+    private func loadUsage() async {
+        guard let api = ServerSettings.client else { usageError = "Connect a server to see usage."; return }
+        do { usage = try await api.usage() } catch { usageError = "Unavailable offline." }
     }
 
     private func save() {

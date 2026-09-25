@@ -1,5 +1,6 @@
 """Screenshot -> analysis -> enrichment -> stored item."""
 
+import json
 import logging
 import mimetypes
 import re
@@ -10,7 +11,9 @@ from typing import Any
 import anthropic
 import httpx
 
-from .analyzer import AnalysisError, ScreenshotAnalyzer
+from .analyzer import AnalysisError
+from .analyzers import AnalyzerRouter, Deferred
+from .usage import Run, claude_cost
 from .config import Settings
 from .db import Database, normalize_tag
 from .enrich import Enrichment, run_enrichers
@@ -154,44 +157,77 @@ def corrected_analysis(previous: dict, correction: dict) -> dict:
 
 
 class Pipeline:
-    def __init__(self, db: Database, settings: Settings, analyzer: ScreenshotAnalyzer, http: httpx.AsyncClient):
+    def __init__(self, db: Database, settings: Settings, analyzer: Any, http: httpx.AsyncClient):
         self.db, self.settings, self.analyzer, self.http = db, settings, analyzer, http
 
-    async def process(self, item_id: str, correction: dict | None = None) -> dict | None:
-        """Identify the screenshot with Claude (optionally guided by a user's correction)."""
+    async def process(self, item_id: str, correction: dict | None = None, purpose: str = "analyze") -> dict | None:
+        """Identify the screenshot (optionally guided by a user's correction)."""
         item = self.db.get_item(item_id)
         if not item:
             return None
+        path = self.settings.uploads_dir / item["image_file"]
+        media_type = mimetypes.guess_type(path.name)[0] or "image/png"
+        context = None
+        if correction:
+            context = {**correction, "previous_title": item.get("title"), "previous_category": item.get("category")}
+        kwargs: dict[str, Any] = {"note": item.get("note"), "correction": context}
+        if isinstance(self.analyzer, AnalyzerRouter):
+            # The user is waiting on corrections and re-analyses: never send those to a batch.
+            kwargs["interactive"] = purpose != "analyze"
 
-        async def run():
-            path = self.settings.uploads_dir / item["image_file"]
-            media_type = mimetypes.guess_type(path.name)[0] or "image/png"
-            context = None
-            if correction:
-                context = {**correction, "previous_title": item.get("title"), "previous_category": item.get("category")}
-            analysis = await self.analyzer.analyze(Path(path).read_bytes(), media_type, note=item.get("note"), correction=context)
+        async def identify() -> dict:
+            analysis = await self.analyzer.analyze(Path(path).read_bytes(), media_type, **kwargs)
             if correction:
                 # The user's explicit facts beat the model's.
                 explicit = {k: correction[k] for k in CORRECTABLE if correction.get(k) not in (None, "")}
                 analysis.update(explicit)
                 if explicit:
                     analysis["confidence"], analysis["confidence_reason"] = 100, "Corrected by you."
-            return await self.apply_analysis(item_id, analysis, corrected=bool(correction))
+            return analysis
 
-        return await self._guard(item_id, run())
+        return await self._run(item_id, purpose, identify(), corrected=bool(correction))
 
     async def correct(self, item_id: str, correction: dict) -> dict | None:
-        """Apply a user's correction. With a free-text hint Claude looks again; otherwise the
+        """Apply a user's correction. With a free-text hint the model looks again; otherwise the
         corrected facts are used as-is and only the metadata lookups run."""
         if correction.get("hint"):
-            return await self.process(item_id, correction)
+            return await self.process(item_id, correction, purpose="correct")
         item = self.db.get_item(item_id)
         if not item:
             return None
         previous = item.get("analysis") if isinstance(item.get("analysis"), dict) else {
             k: item.get(k) for k in ("title", "category", "canonical_url", "subtitle", "summary", "source_platform")
         }
-        return await self._guard(item_id, self.apply_analysis(item_id, corrected_analysis(previous, correction), corrected=True))
+
+        async def fixed() -> dict:
+            return corrected_analysis(previous, correction)
+
+        return await self._run(item_id, "correct", fixed(), corrected=True)
+
+    async def complete_batch_job(self, job: dict, result: Any) -> dict | None:
+        """Finish an analysis whose Claude step ran in a Message Batch."""
+        params, context = json.loads(job["params"]), json.loads(job["context"])
+        router: AnalyzerRouter = self.analyzer
+
+        async def finish() -> dict:
+            if getattr(result, "type", None) == "succeeded":
+                return await router.finish_batch(params, result.message, context)
+            # errored / expired / canceled: run it now at the normal price rather than leave it stuck
+            log.warning("Batch request for %s ended as %s; running it in real time", job["item_id"], getattr(result, "type", "?"))
+            return router.finish(await router.claude.run(params), context)
+
+        if not self.db.get_item(job["item_id"]):
+            # Deleted while queued: still account for what the batch cost.
+            if getattr(result, "type", None) == "succeeded":
+                self.db.record_runs(job["item_id"], [self._batch_only_run(result.message)], job["purpose"])
+            return None
+        return await self._run(job["item_id"], job["purpose"], finish(), corrected=job["purpose"] == "correct")
+
+    def _batch_only_run(self, message: Any) -> dict:
+        run = Run("claude", model=getattr(message, "model", ""), mode="batch")
+        run.add_claude_usage(getattr(message, "usage", None))
+        run.cost_usd = claude_cost(run)
+        return run.to_dict()
 
     async def apply_analysis(self, item_id: str, analysis: dict, corrected: bool = False) -> dict | None:
         enrichments = await run_enrichers(analysis, self.settings, self.http)
@@ -210,17 +246,33 @@ class Pipeline:
             corrected=int(corrected or bool(item.get("corrected"))),
         )
 
-    async def _guard(self, item_id: str, work) -> dict | None:
+    async def _run(self, item_id: str, purpose: str, work, corrected: bool) -> dict | None:
+        """Run an identification, record what it cost, and store the result or the error."""
         try:
-            return await work
+            analysis = await work
+        except Deferred as d:
+            self.db.record_runs(item_id, d.context.get("runs", []), purpose)  # OCR / local runs so far
+            d.context["runs"] = []
+            self.db.add_batch_job(item_id, purpose, d.params, d.context)
+            return self.db.get_item(item_id)
         except AnalysisError as e:
+            self.db.record_runs(item_id, e.runs, purpose)
             return self.db.update_item(item_id, status="error", error=str(e))
-        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
+            self.db.record_runs(item_id, getattr(e, "keeper_runs", []), purpose)
             return self.db.update_item(item_id, status="error", error=(
                 "The server's Anthropic API key is missing or invalid. Set ANTHROPIC_API_KEY and re-analyze."
             ))
         except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError) as e:
+            self.db.record_runs(item_id, getattr(e, "keeper_runs", []), purpose)
             return self.db.update_item(item_id, status="error", error=f"Temporary problem reaching Claude ({type(e).__name__}). Try re-analyzing.")
         except Exception as e:  # keep the item; the user can retry
             log.exception("Processing %s failed", item_id)
+            self.db.record_runs(item_id, getattr(e, "keeper_runs", []), purpose)
+            return self.db.update_item(item_id, status="error", error=f"{type(e).__name__}: {e}")
+        self.db.record_runs(item_id, analysis.pop("_runs", []), purpose)
+        try:
+            return await self.apply_analysis(item_id, analysis, corrected=corrected)
+        except Exception as e:
+            log.exception("Storing the analysis for %s failed", item_id)
             return self.db.update_item(item_id, status="error", error=f"{type(e).__name__}: {e}")

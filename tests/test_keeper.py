@@ -312,19 +312,35 @@ def block(**kw):
     return SimpleNamespace(**kw)
 
 
+def usage(inp, out, searches=0, fetches=0, cache_read=0):
+    return SimpleNamespace(input_tokens=inp, output_tokens=out, cache_read_input_tokens=cache_read,
+                           cache_creation_input_tokens=0,
+                           server_tool_use=SimpleNamespace(web_search_requests=searches, web_fetch_requests=fetches))
+
+
 async def test_analyzer_resumes_pause_turn_and_returns_tool_input():
     result = analysis()
     client, messages = fake_client([
-        SimpleNamespace(stop_reason="pause_turn", content=[block(type="server_tool_use", id="s1", name="web_search", input={})]),
-        SimpleNamespace(stop_reason="tool_use", content=[block(type="tool_use", id="t1", name="save_analysis", input=result)]),
+        SimpleNamespace(stop_reason="pause_turn", model="claude-opus-5", usage=usage(20_000, 1_000, searches=2, fetches=1),
+                        content=[block(type="server_tool_use", id="s1", name="web_search", input={})]),
+        SimpleNamespace(stop_reason="tool_use", model="claude-opus-5", usage=usage(30_000, 2_000, searches=1),
+                        content=[block(type="tool_use", id="t1", name="save_analysis", input=result)]),
     ])
     out = await ScreenshotAnalyzer(client=client, model="claude-opus-5").analyze(png_bytes(), "image/png", note="hi")
+    [run] = out.pop("_runs")
     assert out == result
+    assert run["input_tokens"] == 50_000 and run["output_tokens"] == 3_000 and run["requests"] == 2
+    assert run["web_searches"] == 3 and run["web_fetches"] == 1 and run["mode"] == "realtime"
+    # 50k in x $5/M + 3k out x $25/M + 3 searches x $0.01
+    assert run["cost_usd"] == pytest.approx(0.25 + 0.075 + 0.03)
     first, second = messages.requests
     assert first["model"] == "claude-opus-5"
     assert first["fallbacks"] == "default"
     assert first["betas"] == ["server-side-fallback-2026-07-01"]
     assert {t["name"] for t in first["tools"]} == {"web_search", "web_fetch", "save_analysis"}
+    fetch = next(t for t in first["tools"] if t["name"] == "web_fetch")
+    assert fetch["max_content_tokens"] == 8000           # cost cap on fetched pages
+    assert first["output_config"] == {"effort": "medium"}
     assert "hi" in first["messages"][0]["content"][1]["text"]
     assert second["messages"][-1]["role"] == "assistant"
 
@@ -334,9 +350,10 @@ async def test_analyzer_nudges_once_then_fails():
         SimpleNamespace(stop_reason="end_turn", content=[block(type="text", text="It's a movie.")]),
         SimpleNamespace(stop_reason="end_turn", content=[block(type="text", text="Still a movie.")]),
     ])
-    with pytest.raises(AnalysisError):
+    with pytest.raises(AnalysisError) as err:
         await ScreenshotAnalyzer(client=client, model="claude-sonnet-5").analyze(png_bytes(), "image/png")
     assert "fallbacks" not in messages.requests[0]
+    assert err.value.runs and err.value.runs[0]["requests"] == 2  # spend is kept even though it failed
     assert "save_analysis" in messages.requests[1]["messages"][-1]["content"]
 
 

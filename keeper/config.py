@@ -39,7 +39,7 @@ class Settings:
     anthropic_api_key: str | None = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY") or None)
     # On-prem LLM: any OpenAI-compatible server (Ollama, vLLM, LM Studio, llama.cpp server)
     local_llm_url: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_URL") or None)
-    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL", "qwen2.5vl:7b"))
+    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL", "qwen3-vl:8b"))
     local_llm_api_key: str | None = field(default_factory=lambda: os.environ.get("LOCAL_LLM_API_KEY") or None)
     # Set to false for text-only models: they then get the OCR text instead of the image.
     local_llm_vision: bool = field(default_factory=lambda: _env("LOCAL_LLM_VISION", "true").lower() not in ("0", "false", "no"))
@@ -49,6 +49,15 @@ class Settings:
     # OCR pre-pass: rapidocr (bundled, CPU) | tesseract (needs the binary; better for Hebrew/Arabic/...) | off
     ocr_engine: str = field(default_factory=lambda: _env("KEEPER_OCR", "rapidocr").lower())
     ocr_langs: str = field(default_factory=lambda: _env("KEEPER_OCR_LANGS", "eng"))  # tesseract only, e.g. eng+heb
+    # Cost controls for Claude (see docs/COSTS.md)
+    effort: str = field(default_factory=lambda: _env("KEEPER_EFFORT", "medium").lower())         # low|medium|high|xhigh|max
+    fetch_max_tokens: int = field(default_factory=lambda: int(_env("KEEPER_FETCH_MAX_TOKENS", "8000")))  # 0 = no cap
+    # Send new screenshots to Claude through the Message Batches API (50% cheaper; results in minutes, max 24 h)
+    claude_batch: bool = field(default_factory=lambda: _env("KEEPER_CLAUDE_BATCH", "true").lower() not in ("0", "false", "no", "off"))
+    batch_poll_seconds: int = field(default_factory=lambda: int(_env("KEEPER_BATCH_POLL_SECONDS", "60")))
+    # Running cost of your on-prem inference box, for the usage report (e.g. 350 W at $0.20/kWh = 0.07)
+    local_cost_per_hour: float = field(default_factory=lambda: float(_env("KEEPER_LOCAL_COST_PER_HOUR", "0")))
+
     # Online metadata lookups (TMDB, GitHub, recipe pages...). Turn off for air-gapped installs.
     enrich: bool = field(default_factory=lambda: _env("KEEPER_ENRICH", "on").lower() not in ("0", "off", "false", "no"))
 

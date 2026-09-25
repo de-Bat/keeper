@@ -119,6 +119,16 @@ struct ItemDetailView: View {
                 Button(role: .destructive) { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
             }
 
+            if let usage = item.usage, usage.runs > 0 {
+                Section("Identification") {
+                    LabeledContent("Cost", value: formatUSD(usage.costUsd))
+                    if usage.webSearches > 0 { LabeledContent("Web searches", value: "\(usage.webSearches)") }
+                    if let sources = item.metadata["sources"]?.strings, !sources.isEmpty {
+                        LabeledContent("Via", value: sources.joined(separator: " → "))
+                    }
+                }
+            }
+
             if let text = item.meta("screenshot_text") {
                 Section("Text in screenshot") { Text(text).font(.footnote).foregroundStyle(.secondary) }
             }
@@ -146,6 +156,9 @@ struct ItemDetailView: View {
             Label(item.error ?? "Analysis failed", systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.footnote)
         } else if item.pendingUpload {
             Label("Saved on this phone. It will be uploaded and identified when your server is reachable.", systemImage: "icloud.and.arrow.up")
+                .font(.footnote).foregroundStyle(.secondary)
+        } else if item.batchPending {
+            Label("Queued for Claude batch processing (half price). Usually done within an hour, at most 24 h.", systemImage: "hourglass")
                 .font(.footnote).foregroundStyle(.secondary)
         } else if item.status == "processing" {
             Label("Identifying… this usually takes under a minute.", systemImage: "sparkles").font(.footnote).foregroundStyle(.secondary)

@@ -1,5 +1,6 @@
 """HTTP API and web UI."""
 
+import asyncio
 import hmac
 import logging
 import mimetypes
@@ -19,6 +20,7 @@ from pydantic import BaseModel
 
 from .analyzer import CATEGORIES, AnalysisError
 from .analyzers import AnalyzerRouter
+from .batch import BatchWorker
 from .config import Settings
 from .db import Database
 from .pipeline import Pipeline
@@ -56,6 +58,7 @@ def create_app(
     settings: Settings | None = None,
     analyzer: Any = None,
     http: httpx.AsyncClient | None = None,
+    start_batch_worker: bool = True,
 ) -> FastAPI:
     settings = settings or Settings()
     settings.uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -73,7 +76,13 @@ def create_app(
                 logging.getLogger("keeper").error("Analyzer not available: %s", e)
                 chosen = _Unavailable(str(e))
         state["pipeline"] = app.state.pipeline = Pipeline(db, settings, chosen, client)
+        worker_task = None
+        if isinstance(chosen, AnalyzerRouter) and chosen.batch and chosen.claude is not None and start_batch_worker:
+            app.state.batch_worker = BatchWorker(db, state["pipeline"], chosen.claude.client, settings.batch_poll_seconds)
+            worker_task = asyncio.create_task(app.state.batch_worker.run_forever())
         yield
+        if worker_task:
+            worker_task.cancel()
         if http is None:
             await client.aclose()
 
@@ -173,7 +182,7 @@ def create_app(
     def reanalyze(item_id: str, background: BackgroundTasks):
         get_or_404(item_id)
         item = db.update_item(item_id, status="processing", error=None)
-        background.add_task(state["pipeline"].process, item_id)
+        background.add_task(state["pipeline"].process, item_id, None, "reanalyze")
         return item
 
     @app.post("/api/items/{item_id}/correct", status_code=202)
@@ -198,6 +207,17 @@ def create_app(
         item = get_or_404(item_id)
         db.delete_item(item_id)
         (settings.uploads_dir / item["image_file"]).unlink(missing_ok=True)
+
+    @app.get("/api/usage")
+    def usage(days: int = Query(30, ge=1, le=366)):
+        """Measured cost of identifying screenshots: totals, per screenshot, per analyzer, per day."""
+        report = db.usage_report(days)
+        report["config"] = {
+            "analyzer": settings.resolved_analyzer(), "claude_model": settings.model, "effort": settings.effort,
+            "claude_batch": settings.claude_batch, "fetch_max_tokens": settings.fetch_max_tokens,
+            "escalate_below": settings.escalate_below,
+        }
+        return report
 
     @app.get("/api/tags")
     def tags():

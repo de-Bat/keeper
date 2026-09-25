@@ -97,6 +97,19 @@ struct Correction: Codable, Equatable {
     var hasFacts: Bool { title != nil || category != nil || year != nil || canonicalUrl != nil }
 }
 
+/// What identifying this item cost (measured on the server).
+struct ItemUsage: Codable, Equatable {
+    var costUsd: Double
+    var runs: Int
+    var webSearches: Int
+    var via: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case runs, via
+        case costUsd = "cost_usd", webSearches = "web_searches"
+    }
+}
+
 struct Item: Codable, Identifiable, Equatable {
     var id: String
     var createdAt: String
@@ -120,6 +133,8 @@ struct Item: Codable, Identifiable, Equatable {
     var alternatives: [Alternative]
     var corrected: Bool
     var needsReview: Bool
+    var usage: ItemUsage?
+    var batchPending: Bool
 
     // Local-only state
     var localImage: String?            // file name in AppGroup.images
@@ -132,6 +147,7 @@ struct Item: Codable, Identifiable, Equatable {
         case localImage = "local_image", pendingUpload = "pending_upload"
         case confidence, alternatives, corrected
         case confidenceReason = "confidence_reason", needsReview = "needs_review"
+        case usage, batchPending = "batch_pending"
     }
 
     init(localID: String, localImage: String, note: String?, createdAt: Date) {
@@ -149,6 +165,7 @@ struct Item: Codable, Identifiable, Equatable {
         alternatives = []
         corrected = false
         needsReview = false
+        batchPending = false
     }
 
     init(from decoder: Decoder) throws {
@@ -175,6 +192,8 @@ struct Item: Codable, Identifiable, Equatable {
         alternatives = (try? c.decodeIfPresent([Alternative].self, forKey: .alternatives)) ?? []
         corrected = (try? c.decodeIfPresent(Bool.self, forKey: .corrected)) ?? false
         needsReview = (try? c.decodeIfPresent(Bool.self, forKey: .needsReview)) ?? false
+        usage = try? c.decodeIfPresent(ItemUsage.self, forKey: .usage)
+        batchPending = (try? c.decodeIfPresent(Bool.self, forKey: .batchPending)) ?? false
         localImage = try c.decodeIfPresent(String.self, forKey: .localImage)
         pendingUpload = try c.decodeIfPresent(Bool.self, forKey: .pendingUpload) ?? false
     }

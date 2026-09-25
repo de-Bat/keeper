@@ -151,6 +151,10 @@ struct APIClient {
         return try await send(req)
     }
 
+    func usage(days: Int = 30) async throws -> UsageReport {
+        try await send(request("api/usage?days=\(days)"))
+    }
+
     func reanalyze(id: String) async throws -> Item {
         try await send(request("api/items/\(id)/reanalyze", method: "POST"))
     }
@@ -205,4 +209,46 @@ struct APIClient {
 
 private extension Data {
     mutating func append(_ string: String) { append(Data(string.utf8)) }
+}
+
+/// GET /api/usage: measured cost of identifying screenshots.
+struct UsageReport: Decodable {
+    struct Totals: Decodable {
+        let screenshots: Int
+        let costUsd: Double
+        let webSearches: Int
+        enum CodingKeys: String, CodingKey {
+            case screenshots
+            case costUsd = "cost_usd", webSearches = "web_searches"
+        }
+    }
+    struct Analyzer: Decodable, Identifiable {
+        let analyzer: String
+        let mode: String?
+        let model: String?
+        let runs: Int
+        let costUsd: Double?
+        let avgCostUsd: Double?
+        var id: String { "\(analyzer)|\(mode ?? "")|\(model ?? "")" }
+        enum CodingKeys: String, CodingKey {
+            case analyzer, mode, model, runs
+            case costUsd = "cost_usd", avgCostUsd = "avg_cost_usd"
+        }
+    }
+    let periodDays: Int
+    let totals: Totals
+    let perScreenshotUsd: Double
+    let projected30dUsd: Double
+    let claudeShare: Double
+    let byAnalyzer: [Analyzer]
+
+    enum CodingKeys: String, CodingKey {
+        case totals
+        case periodDays = "period_days", perScreenshotUsd = "per_screenshot_usd"
+        case projected30dUsd = "projected_30d_usd", claudeShare = "claude_share", byAnalyzer = "by_analyzer"
+    }
+}
+
+func formatUSD(_ value: Double) -> String {
+    value == 0 ? "$0" : value < 0.01 ? String(format: "$%.4f", value) : String(format: value < 1 ? "$%.3f" : "$%.2f", value)
 }

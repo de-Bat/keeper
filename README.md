@@ -14,6 +14,8 @@ It also records **where you saw it** (Facebook, Instagram, web…), who posted i
 
 Every identification comes with a **confidence score** and, when the model isn't sure, a list of **alternatives**. If it got something wrong you can **correct it**: pick an alternative, fix the title/type/year/link, or describe it in words and let Claude look again.
 
+**Cost:** about **$0.05 per screenshot** with the default hybrid setup, and every analysis's real cost is measured and shown in the app. See [docs/COSTS.md](docs/COSTS.md). **Model and OCR choices:** [docs/MODELS.md](docs/MODELS.md).
+
 **Clients:** an installable **PWA** (Add to Home Screen on iPhone) and a native **iOS app** with a Share Extension. Both work **offline** and sync when they can reach your self-hosted server.
 
 ## How it works
@@ -38,7 +40,7 @@ Set `KEEPER_ANALYZER` in `.env`:
 |---|---|---|---|
 | `claude` | Claude with web search | Best: reads the screenshot, then checks online and finds the IMDb page, repo, recipe… | Screenshot is sent to Anthropic; per-request cost |
 | `local` | Your LLM (Ollama, vLLM, LM Studio, llama.cpp: anything OpenAI-compatible) | Good with a 7B+ vision model on well-known titles; no web search, so it relies on what the model knows. The metadata lookups still confirm and fill in the details | Screenshots stay on your network |
-| `hybrid` | Local first; Claude only when the local model's confidence is below `KEEPER_ESCALATE_BELOW` (default 70) or it fails | Close to `claude` | Only the hard cases leave your network |
+| **`hybrid`** (recommended; the default in `.env.example`) | Local first; Claude only when the local model's confidence is below `KEEPER_ESCALATE_BELOW` (default 70) or it fails. If the local server is down, Claude is used and the local server is retried after 5 minutes | Close to `claude` | Only the hard cases leave your network; ~$0.05/screenshot |
 | `ocr` | No LLM: OCR + rules | Rough: finds GitHub/IMDb links, the platform, the poster; flags everything for review | Fully local, ~1 s on CPU |
 | `auto` (default) | `hybrid` if both are configured, else whichever is, else `ocr` | | |
 
@@ -46,15 +48,15 @@ Set `KEEPER_ANALYZER` in `.env`:
 
 ```bash
 docker compose --profile local up -d                      # starts Keeper + Ollama (GPU block in docker-compose.yml)
-docker compose exec ollama ollama pull qwen2.5vl:7b       # ~6 GB; a vision model that reads screenshots well
+docker compose exec ollama ollama pull qwen3-vl:8b        # ~6 GB; a vision model that reads screenshots well
 # .env:
 #   LOCAL_LLM_URL=http://ollama:11434/v1
-#   LOCAL_LLM_MODEL=qwen2.5vl:7b
-#   KEEPER_ANALYZER=local          # or hybrid, with ANTHROPIC_API_KEY also set
+#   LOCAL_LLM_MODEL=qwen3-vl:8b
+#   KEEPER_ANALYZER=hybrid         # with ANTHROPIC_API_KEY set; or local for no cloud at all
 docker compose up -d keeper
 ```
 
-Vision models that work well: `qwen2.5vl:7b` / `:32b`, `gemma3:12b` / `:27b`, `llama3.2-vision:11b`, `minicpm-v`. A 7B model wants ~8 GB of VRAM; on CPU expect 30 s–several minutes per screenshot (`LOCAL_LLM_TIMEOUT`). Text-only models (e.g. `llama3.1:8b`, `qwen2.5:14b`) also work with `LOCAL_LLM_VISION=false`: they get the OCR text instead of the image.
+Recommended vision models: **Qwen3-VL** (`qwen3-vl:8b` for 8–16 GB, `:30b` / `:32b` for 24 GB) and **Gemma 4** (E4B, 12B, 26B, 31B). An 8B model needs ~6–8 GB of VRAM; on CPU expect 30 s to several minutes per screenshot (`LOCAL_LLM_TIMEOUT`). Text-only models also work with `LOCAL_LLM_VISION=false`: they get the OCR text instead of the image. Hardware tiers, runtimes (Ollama, vLLM, llama.cpp, LM Studio), hosted alternatives and OCR engines are compared in **[docs/MODELS.md](docs/MODELS.md)**.
 
 Keeper asks the server for schema-constrained JSON and falls back to plain JSON mode for servers that don't support it. Small models' sloppy output (wrong category names, `0.8` instead of `80`, missing fields) is normalized.
 
@@ -72,6 +74,22 @@ Engines (`KEEPER_OCR`):
 - `off`
 
 For a fully **air-gapped** install, combine `KEEPER_ANALYZER=local` (or `ocr`) with `KEEPER_ENRICH=off`, so TMDB, GitHub and recipe pages are never contacted.
+
+## Cost
+
+| Mode | Per screenshot |
+|---|---|
+| `hybrid` (default) | ~$0.05 average (~25% go to Claude) |
+| `claude`, batched | ~$0.06 easy · ~$0.21 typical · up to ~$0.70 |
+| `local` / `ocr` | electricity only |
+
+These cost controls are on by default:
+- **Batches:** new screenshots go to Claude through the Message Batches API, 50% off, with results usually within the hour. Re-analyses and corrections always run immediately.
+- **`KEEPER_EFFORT=medium`:** Claude thinks less, so fewer output tokens.
+- **`KEEPER_FETCH_MAX_TOKENS=8000`:** caps how much of each fetched web page Claude reads.
+- **Hybrid mode:** only screenshots the local model is unsure about go to Claude.
+
+**Real costs are measured.** Keeper records the tokens, web searches, time and cost of every analysis. See them under **$ Usage & cost** in the web app, in Settings in the iOS app, per item in its details, or via `GET /api/usage`. The full breakdown, assumptions and tuning advice are in **[docs/COSTS.md](docs/COSTS.md)**.
 
 ## Confidence & corrections
 
@@ -114,6 +132,9 @@ uvicorn keeper.main:create_app --factory --host 0.0.0.0 --port 8000
 | `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL` | for `local`/`hybrid` | Your OpenAI-compatible LLM server and model |
 | `KEEPER_OCR`, `KEEPER_OCR_LANGS` | optional | `rapidocr` (default), `tesseract` (+ languages), `off` |
 | `KEEPER_ENRICH` | optional | `off` disables all online metadata lookups |
+| `KEEPER_CLAUDE_BATCH` | optional | `true` (default): new screenshots use the 50%-off Batches API; `false`: real time |
+| `KEEPER_EFFORT`, `KEEPER_FETCH_MAX_TOKENS` | optional | Claude cost controls (defaults `medium`, `8000`) |
+| `KEEPER_LOCAL_COST_PER_HOUR`, `KEEPER_PRICING` | optional | For the usage report: your local box's running cost; price overrides |
 | `KEEPER_API_TOKEN` | recommended | Shared secret for all API and media requests. Set it whenever the server can be reached from outside localhost. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `TMDB_API_KEY` | optional | Posters, overview, cast, genres, streaming providers (v3 key or v4 read token) |
 | `OMDB_API_KEY` | optional | IMDb rating, Rotten Tomatoes, Metacritic |
@@ -179,9 +200,10 @@ Before running on a device:
 | `POST` | `/api/items/{id}/correct` | JSON with any of `title`, `category`, `year`, `canonical_url` (re-enrich with these facts) and/or `hint` (Claude looks again with your description). Returns `202` |
 | `GET` | `/api/sync?since=` | Delta sync: `{server_time, items, deleted}`. Pass `server_time` back as the next `since` |
 | `GET` | `/api/tags`, `/api/categories` | Counts for filters |
+| `GET` | `/api/usage?days=30` | Measured cost: totals, per screenshot, share sent to Claude, per analyzer, per day |
 | `GET` | `/media/{file}` | Original screenshots |
 
-Items include `confidence` (0–100), `confidence_reason`, `alternatives`, `corrected` and `needs_review`.
+Items include `confidence` (0–100), `confidence_reason`, `alternatives`, `corrected`, `needs_review`, `batch_pending` and `usage` (`cost_usd`, `runs`, `web_searches`, `via`).
 
 When `KEEPER_API_TOKEN` is set, send `Authorization: Bearer <token>`.
 

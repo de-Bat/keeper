@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -20,6 +21,7 @@ import httpx
 from .analyzer import CATEGORIES, PLATFORMS, SAVE_TOOL, SYSTEM_PROMPT, AnalysisError, ScreenshotAnalyzer, correction_prompt, prepare_image
 from .config import Settings
 from .ocr import Ocr, OcrResult, Signals, extract_signals
+from .usage import Run, local_cost
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +136,7 @@ class LocalLLMAnalyzer:
         self.vision = settings.local_llm_vision
         self.timeout = settings.local_llm_timeout
         self.headers = {"Authorization": f"Bearer {settings.local_llm_api_key}"} if settings.local_llm_api_key else {}
+        self.cost_per_hour = settings.local_cost_per_hour
         self.http = http or httpx.AsyncClient()
         self._format_mode = "json_schema"  # downgraded automatically if the server doesn't support it
 
@@ -164,11 +167,29 @@ class LocalLLMAnalyzer:
             "temperature": 0.1,
             "stream": False,
         }
-        return normalize(parse_json(await self._complete(body)))
+        run = Run("local", model=self.model, mode="local")
+        started = time.monotonic()
+        try:
+            text, usage = await self._complete(body)
+            result = normalize(parse_json(text))
+        except AnalysisError as e:
+            run.ok = False
+            e.runs = [self._finish_run(run, started, {})]
+            raise
+        result["_runs"] = [self._finish_run(run, started, usage)]
+        return result
+
+    def _finish_run(self, run: Run, started: float, usage: dict) -> dict:
+        run.requests = 1
+        run.duration_ms = int((time.monotonic() - started) * 1000)
+        run.input_tokens = int(usage.get("prompt_tokens") or 0)
+        run.output_tokens = int(usage.get("completion_tokens") or 0)
+        run.cost_usd = local_cost(run.duration_ms, self.cost_per_hour)
+        return run.to_dict()
 
     FORMATS = ("json_schema", "json_object", "none")
 
-    async def _complete(self, body: dict) -> str:
+    async def _complete(self, body: dict) -> tuple[str, dict]:
         # Prefer schema-constrained decoding; step down for servers that don't support it,
         # and remember what worked so later requests skip the failed attempts.
         for mode in self.FORMATS[self.FORMATS.index(self._format_mode):]:
@@ -190,7 +211,8 @@ class LocalLLMAnalyzer:
                 raise AnalysisError(f"Local LLM error {r.status_code}: {r.text[:300]}")
             self._format_mode = mode
             try:
-                return r.json()["choices"][0]["message"]["content"] or ""
+                data = r.json()
+                return data["choices"][0]["message"]["content"] or "", data.get("usage") or {}
             except (KeyError, IndexError, ValueError, TypeError) as e:
                 raise AnalysisError(f"Unexpected reply from the local LLM: {r.text[:300]}") from e
         raise AnalysisError("The local LLM rejected every request format.")
@@ -230,53 +252,107 @@ def rules_analysis(ocr: OcrResult | None, signals: Signals | None, note: str | N
     return out
 
 
+class Deferred(Exception):
+    """The Claude step was queued for the Batches API; the pipeline finishes it later."""
+
+    def __init__(self, params: dict, context: dict):
+        super().__init__("queued for batch")
+        self.params, self.context = params, context
+
+
 class AnalyzerRouter:
     """Runs OCR once, then the configured backend(s)."""
+
+    LOCAL_RETRY_AFTER = 300  # seconds to skip an unreachable local server in hybrid mode
 
     def __init__(self, settings: Settings, http: httpx.AsyncClient, ocr: Ocr | None = None,
                  claude: Any = None, local: Any = None):
         self.mode = settings.resolved_analyzer()
         self.escalate_below = settings.escalate_below
+        self.batch = settings.claude_batch
         self.ocr = ocr if ocr is not None else Ocr(settings.ocr_engine, settings.ocr_langs)
         self.claude = claude
         self.local = local
+        self._local_down_until = 0.0
         if self.mode in ("claude", "hybrid") and self.claude is None:
             if not settings.anthropic_api_key:
                 raise ValueError(f"KEEPER_ANALYZER={self.mode} needs ANTHROPIC_API_KEY")
-            self.claude = ScreenshotAnalyzer(model=settings.model)
+            self.claude = ScreenshotAnalyzer(model=settings.model, effort=settings.effort or None,
+                                             fetch_max_tokens=settings.fetch_max_tokens or None)
         if self.mode in ("local", "hybrid") and self.local is None:
             self.local = LocalLLMAnalyzer(settings, http)
-        log.info("Analyzer: %s (OCR: %s)", self.mode, settings.ocr_engine)
+        log.info("Analyzer: %s (OCR: %s, Claude batch: %s)", self.mode, settings.ocr_engine, self.batch)
 
-    async def analyze(self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None) -> dict:
+    async def analyze(self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
+                      interactive: bool = False) -> dict:
+        """`interactive` requests (the user is waiting, e.g. a correction) never go through a batch."""
+        started = time.monotonic()
         ocr = await self.ocr.read(image)
         signals = extract_signals(ocr) if ocr and ocr.lines else None
         hints = hints_prompt(ocr, signals)
-        used: list[str] = ["ocr"] if ocr and ocr.lines else []
+        context: dict[str, Any] = {"used": [], "runs": [], "ocr_text": ocr.text if ocr and ocr.lines else ""}
+        if ocr and ocr.lines:
+            context["used"].append("ocr")
+            context["runs"].append(Run("ocr", model=ocr.engine, mode="local", requests=1,
+                                       duration_ms=int((time.monotonic() - started) * 1000)).to_dict())
+
+        async def claude_step() -> dict:
+            if self.batch and not interactive:
+                raise Deferred(self.claude.build_params(image, media_type, note, correction, hints), context)
+            try:
+                result = await self.claude.analyze(image, media_type, note=note, correction=correction, hints=hints)
+            except AnalysisError as e:
+                e.runs = context["runs"] + e.runs
+                raise
+            context["used"].append("claude")
+            return result
 
         if self.mode == "ocr":
             result = rules_analysis(ocr, signals, note)
-            used.append("rules")
+            context["used"].append("rules")
         elif self.mode == "claude":
-            result = await self.claude.analyze(image, media_type, note=note, correction=correction, hints=hints)
-            used.append("claude")
+            result = await claude_step()
         elif self.mode == "local":
-            result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints)
-            used.append(self.local.label)
-        else:  # hybrid
-            result = None
             try:
                 result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints)
-                used.append(self.local.label)
             except AnalysisError as e:
-                log.warning("Local model failed, asking Claude: %s", e)
+                e.runs = context["runs"] + e.runs
+                raise
+            context["used"].append(self.local.label)
+        else:  # hybrid
+            result = None
+            if time.monotonic() >= self._local_down_until:
+                try:
+                    result = await self.local.analyze(image, media_type, note=note, correction=correction, hints=hints)
+                    context["used"].append(self.local.label)
+                except AnalysisError as e:
+                    context["runs"] += e.runs
+                    if "Can't reach" in str(e):
+                        self._local_down_until = time.monotonic() + self.LOCAL_RETRY_AFTER
+                    log.warning("Local model failed, asking Claude: %s", e)
             if result is None or result.get("confidence", 0) < self.escalate_below:
-                result = await self.claude.analyze(image, media_type, note=note, correction=correction, hints=hints)
-                used.append("claude")
+                if result is not None:
+                    context["runs"] += result.pop("_runs", [])
+                    context["local_result"] = {k: v for k, v in result.items() if not k.startswith("_")}
+                result = await claude_step()
+        return self.finish(result, context)
 
-        result["_analyzer"] = used
-        if ocr and ocr.lines:
-            result["_ocr_text"] = ocr.text
+    async def finish_batch(self, params: dict, message: Any, context: dict) -> dict:
+        """Complete a Claude step that ran in a batch."""
+        try:
+            result = await self.claude.finish(params, message)
+        except AnalysisError as e:
+            e.runs = context["runs"] + e.runs
+            raise
+        context["used"].append("claude")
+        return self.finish(result, context)
+
+    @staticmethod
+    def finish(result: dict, context: dict) -> dict:
+        result["_runs"] = context["runs"] + result.pop("_runs", [])
+        result["_analyzer"] = context["used"]
+        if context.get("ocr_text"):
+            result["_ocr_text"] = context["ocr_text"]
             if not result.get("screenshot_text"):
-                result["screenshot_text"] = ocr.text[:500]
+                result["screenshot_text"] = context["ocr_text"][:500]
         return result

@@ -9,9 +9,12 @@ the result always matches the schema below.
 import base64
 import io
 import logging
+import time
 from typing import Any
 
 import anthropic
+
+from .usage import Run, claude_cost
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +152,9 @@ How to work:
 
 
 class AnalysisError(Exception):
-    pass
+    def __init__(self, message: str, runs: list | None = None):
+        super().__init__(message)
+        self.runs = runs or []  # usage already spent before the failure, so it is still recorded
 
 
 def correction_prompt(correction: dict) -> str:
@@ -188,14 +193,27 @@ def prepare_image(data: bytes, media_type: str) -> tuple[bytes, str]:
 
 
 class ScreenshotAnalyzer:
-    def __init__(self, client: anthropic.AsyncAnthropic | None = None, model: str = "claude-opus-5"):
+    """Claude with web search/fetch. Requests can run immediately or through the Batches API."""
+
+    def __init__(
+        self,
+        client: anthropic.AsyncAnthropic | None = None,
+        model: str = "claude-opus-5",
+        effort: str | None = "medium",
+        fetch_max_tokens: int | None = 8000,
+    ):
         self.client = client or anthropic.AsyncAnthropic()
         self.model = model
+        self.effort = effort
+        self.fetch_max_tokens = fetch_max_tokens
 
-    async def analyze(
+    # ---- request construction -------------------------------------------------
+
+    def build_params(
         self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
         hints: str = "",
     ) -> dict:
+        """Messages API parameters for one screenshot (JSON-serializable, so they can be stored for a batch)."""
         image, media_type = prepare_image(image, media_type)
         prompt = "Identify what this screenshot is recommending and catalogue it."
         if note:
@@ -203,57 +221,105 @@ class ScreenshotAnalyzer:
         if correction:
             prompt += "\n\n" + correction_prompt(correction)
         prompt += hints  # OCR text + rule-based clues, if the OCR pre-pass found any
-        messages: list[dict] = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                             "data": base64.standard_b64encode(image).decode()}},
-                {"type": "text", "text": prompt},
-            ],
-        }]
-        tools = [
-            {"type": "web_search_20260209", "name": "web_search", "max_uses": 6},
-            {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
-            SAVE_TOOL,
-        ]
-        nudged = False
-        for _ in range(8):
-            response = await self._create(messages, tools)
-            if response.stop_reason == "refusal":
-                raise AnalysisError("The model declined to analyze this screenshot.")
-
-            for block in response.content:
-                if block.type == "tool_use" and block.name == "save_analysis":
-                    return dict(block.input)
-
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "pause_turn":
-                continue  # long server-side search turn; resend to let it continue
-            if response.stop_reason == "tool_use":
-                # A client tool other than save_analysis — we don't have any, so report back.
-                messages.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": b.id, "is_error": True, "content": "Unknown tool."}
-                    for b in response.content if b.type == "tool_use"
-                ]})
-                continue
-            if nudged:
-                break
-            nudged = True
-            messages.append({"role": "user", "content": "Please record your findings now by calling save_analysis."})
-        raise AnalysisError("The model did not return an analysis.")
-
-    async def _create(self, messages: list[dict], tools: list[dict]):
-        kwargs: dict[str, Any] = dict(
+        # The dynamic-filtering tool versions need Opus/Sonnet 4.6+; older/smaller models get the basic ones.
+        modern = not self.model.startswith(("claude-haiku", "claude-3", "claude-sonnet-4-5", "claude-opus-4-5", "claude-opus-4-1"))
+        search_type = "web_search_20260209" if modern else "web_search_20250305"
+        fetch: dict[str, Any] = {"type": "web_fetch_20260209" if modern else "web_fetch_20250910", "name": "web_fetch", "max_uses": 3}
+        if self.fetch_max_tokens:
+            fetch["max_content_tokens"] = self.fetch_max_tokens  # a whole IMDb/recipe page can be 20k+ tokens
+        params: dict[str, Any] = dict(
             model=self.model,
             max_tokens=16000,
             system=SYSTEM_PROMPT,
             thinking={"type": "adaptive"},
-            tools=tools,
+            tools=[{"type": search_type, "name": "web_search", "max_uses": 6}, fetch, SAVE_TOOL],
             tool_choice={"type": "auto"},
-            messages=messages,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                                 "data": base64.standard_b64encode(image).decode()}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
         )
+        if self.effort and not self.model.startswith("claude-haiku"):
+            params["output_config"] = {"effort": self.effort}
+        return params
+
+    # ---- execution ------------------------------------------------------------
+
+    async def analyze(
+        self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
+        hints: str = "",
+    ) -> dict:
+        return await self.run(self.build_params(image, media_type, note, correction, hints))
+
+    async def run(self, params: dict) -> dict:
+        """Run the identification loop in real time."""
+        run = Run("claude", model=self.model, mode="realtime")
+        return await self._loop(params, run, first=None, runs=[run])
+
+    async def finish(self, params: dict, message: Any) -> dict:
+        """Continue from a batch result. Its tokens are billed at batch rates; any
+        follow-up turns (rare: pause_turn or a missing save_analysis) run in real time."""
+        batch_run = Run("claude", model=self.model, mode="batch")
+        batch_run.add_claude_usage(getattr(message, "usage", None), getattr(message, "model", None))
+        batch_run.cost_usd = claude_cost(batch_run)
+        follow_up = Run("claude", model=self.model, mode="realtime")
+        return await self._loop(params, follow_up, first=message, runs=[batch_run, follow_up])
+
+    async def _loop(self, params: dict, run: Run, first: Any, runs: list[Run]) -> dict:
+        messages = list(params["messages"])
+        started = time.monotonic()
+        nudged = False
+
+        def done() -> list[dict]:
+            run.duration_ms += int((time.monotonic() - started) * 1000)
+            run.cost_usd = claude_cost(run)
+            return [r.to_dict() for r in runs if r.requests]
+
+        try:
+            for _ in range(8):
+                if first is not None:
+                    response, first = first, None
+                else:
+                    response = await self._create({**params, "messages": messages})
+                    run.add_claude_usage(getattr(response, "usage", None), getattr(response, "model", None))
+                if response.stop_reason == "refusal":
+                    raise AnalysisError("The model declined to analyze this screenshot.")
+
+                for block in response.content:
+                    if block.type == "tool_use" and block.name == "save_analysis":
+                        result = dict(block.input)
+                        result["_runs"] = done()
+                        return result
+
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason == "pause_turn":
+                    continue  # long server-side search turn; resend to let it continue
+                if response.stop_reason == "tool_use":
+                    # A client tool other than save_analysis — we don't have any, so report back.
+                    messages.append({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": b.id, "is_error": True, "content": "Unknown tool."}
+                        for b in response.content if b.type == "tool_use"
+                    ]})
+                    continue
+                if nudged:
+                    break
+                nudged = True
+                messages.append({"role": "user", "content": "Please record your findings now by calling save_analysis."})
+            raise AnalysisError("The model did not return an analysis.")
+        except AnalysisError as e:
+            e.runs = done()
+            raise
+        except anthropic.APIError as e:
+            e.keeper_runs = done()  # type: ignore[attr-defined]
+            raise
+
+    async def _create(self, params: dict):
         if self.model in FALLBACK_MODELS:
             return await self.client.beta.messages.create(
-                **kwargs, betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+                **params, betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             )
-        return await self.client.messages.create(**kwargs)
+        return await self.client.messages.create(**params)

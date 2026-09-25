@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,41 @@ CREATE TABLE IF NOT EXISTS tombstones (
     deleted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tombstones_deleted ON tombstones(deleted_at);
+
+-- What each analysis actually consumed and cost. Kept when items are deleted, for reporting.
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id            TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    purpose            TEXT NOT NULL,         -- analyze | reanalyze | correct
+    analyzer           TEXT NOT NULL,         -- claude | local | ocr
+    model              TEXT,
+    mode               TEXT,                  -- realtime | batch | local
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    web_searches       INTEGER NOT NULL DEFAULT 0,
+    web_fetches        INTEGER NOT NULL DEFAULT 0,
+    requests           INTEGER NOT NULL DEFAULT 0,
+    duration_ms        INTEGER NOT NULL DEFAULT 0,
+    cost_usd           REAL NOT NULL DEFAULT 0,
+    ok                 INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS runs_item ON analysis_runs(item_id);
+CREATE INDEX IF NOT EXISTS runs_created ON analysis_runs(created_at);
+
+-- Claude requests waiting for / inside a Message Batch.
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    purpose      TEXT NOT NULL,
+    params       TEXT NOT NULL,              -- Messages API request (JSON)
+    context      TEXT NOT NULL,              -- OCR text, earlier runs, ... (JSON)
+    batch_id     TEXT,                       -- set once submitted
+    submitted_at TEXT
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     item_id UNINDEXED, title, summary, tags, body, tokenize='unicode61 remove_diacritics 2'
@@ -148,6 +183,7 @@ class Database:
                 self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
                 self.conn.execute("DELETE FROM items_fts WHERE item_id = ?", (item_id,))
                 self.conn.execute("INSERT OR REPLACE INTO tombstones (id, deleted_at) VALUES (?, ?)", (item_id, now()))
+                self.conn.execute("DELETE FROM batch_jobs WHERE item_id = ? AND batch_id IS NULL", (item_id,))
         return item
 
     def list_items(
@@ -201,6 +237,85 @@ class Database:
             deleted = []
         return {"server_time": server_time, "items": [self._row_to_item(r) for r in rows], "deleted": deleted}
 
+    # ---- usage ---------------------------------------------------------------
+
+    def record_runs(self, item_id: str, runs: list[dict], purpose: str = "analyze") -> None:
+        cols = ("analyzer", "model", "mode", "input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "web_searches", "web_fetches", "requests", "duration_ms", "cost_usd", "ok")
+
+        def value(run: dict, col: str):
+            if col in ("analyzer", "model", "mode"):
+                return run.get(col) or ("unknown" if col == "analyzer" else None)
+            if col == "ok":
+                return int(bool(run.get("ok", True)))
+            return run.get(col) or 0
+
+        with self.conn:
+            self.conn.executemany(
+                f"INSERT INTO analysis_runs (item_id, created_at, purpose, {', '.join(cols)}) "
+                f"VALUES (?, ?, ?, {', '.join('?' for _ in cols)})",
+                [(item_id, now(), purpose, *(value(r, c) for c in cols)) for r in runs],
+            )
+
+    def usage_report(self, days: int = 30) -> dict:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="microseconds")
+        q = lambda sql, *a: [dict(r) for r in self.conn.execute(sql, (since, *a)).fetchall()]  # noqa: E731
+        totals = q("""SELECT COUNT(DISTINCT item_id) AS screenshots, COUNT(*) AS runs,
+                      COALESCE(SUM(cost_usd), 0) AS cost_usd, COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                      COALESCE(SUM(web_searches), 0) AS web_searches, COALESCE(SUM(web_fetches), 0) AS web_fetches
+                      FROM analysis_runs WHERE created_at >= ?""")[0]
+        by_analyzer = q("""SELECT analyzer, mode, model, COUNT(*) AS runs, COUNT(DISTINCT item_id) AS screenshots,
+                           SUM(cost_usd) AS cost_usd, AVG(cost_usd) AS avg_cost_usd, SUM(input_tokens) AS input_tokens,
+                           SUM(output_tokens) AS output_tokens, SUM(web_searches) AS web_searches,
+                           AVG(duration_ms) AS avg_duration_ms, SUM(1 - ok) AS failures
+                           FROM analysis_runs WHERE created_at >= ? GROUP BY analyzer, mode, model ORDER BY cost_usd DESC""")
+        by_day = q("""SELECT substr(created_at, 1, 10) AS day, COUNT(DISTINCT item_id) AS screenshots, SUM(cost_usd) AS cost_usd
+                      FROM analysis_runs WHERE created_at >= ? GROUP BY day ORDER BY day""")
+        escalated = q("""SELECT COUNT(DISTINCT item_id) AS n FROM analysis_runs
+                         WHERE created_at >= ? AND analyzer = 'claude'""")[0]["n"]
+        n = totals["screenshots"] or 0
+        per = totals["cost_usd"] / n if n else 0.0
+        active_days = len(by_day) or 1
+        return {
+            "period_days": days,
+            "totals": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in totals.items()},
+            "per_screenshot_usd": round(per, 4),
+            "claude_share": round(escalated / n, 3) if n else 0.0,
+            "projected_30d_usd": round(totals["cost_usd"] / min(days, max(active_days, 1)) * 30, 2) if n else 0.0,
+            "by_analyzer": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()} for r in by_analyzer],
+            "by_day": [{**r, "cost_usd": round(r["cost_usd"], 4)} for r in by_day],
+        }
+
+    # ---- batch jobs ----------------------------------------------------------
+
+    def add_batch_job(self, item_id: str, purpose: str, params: dict, context: dict) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM batch_jobs WHERE item_id = ? AND batch_id IS NULL", (item_id,))
+            self.conn.execute(
+                "INSERT INTO batch_jobs (item_id, created_at, purpose, params, context) VALUES (?, ?, ?, ?, ?)",
+                (item_id, now(), purpose, json.dumps(params), json.dumps(context)),
+            )
+
+    def unsubmitted_jobs(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM batch_jobs WHERE batch_id IS NULL ORDER BY id")]
+
+    def mark_submitted(self, job_ids: list[int], batch_id: str) -> None:
+        with self.conn:
+            self.conn.executemany("UPDATE batch_jobs SET batch_id = ?, submitted_at = ? WHERE id = ?",
+                                  [(batch_id, now(), j) for j in job_ids])
+
+    def open_batches(self) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT DISTINCT batch_id FROM batch_jobs WHERE batch_id IS NOT NULL")]
+
+    def batch_job(self, job_id: int) -> dict | None:
+        row = self.conn.execute("SELECT * FROM batch_jobs WHERE id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_batch_job(self, job_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM batch_jobs WHERE id = ?", (job_id,))
+
     # ---- tags --------------------------------------------------------------
 
     def set_tags(self, item_id: str, tags: list[str]) -> list[str]:
@@ -246,6 +361,17 @@ class Database:
             and item.get("confidence") is not None and item["confidence"] < REVIEW_THRESHOLD
         )
         item["tags"] = self.get_tags(item["id"])
+        cost = self.conn.execute(
+            "SELECT COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS cost, "
+            "COALESCE(SUM(web_searches), 0) AS searches, GROUP_CONCAT(DISTINCT analyzer || ':' || mode) AS how "
+            "FROM analysis_runs WHERE item_id = ?", (item["id"],),
+        ).fetchone()
+        item["usage"] = {
+            "cost_usd": round(cost["cost"], 4), "runs": cost["runs"], "web_searches": cost["searches"],
+            "via": sorted((cost["how"] or "").split(",")) if cost["how"] else [],
+        }
+        item["batch_pending"] = self.conn.execute(
+            "SELECT 1 FROM batch_jobs WHERE item_id = ? LIMIT 1", (item["id"],)).fetchone() is not None
         return item
 
     def _reindex(self, item_id: str) -> None:

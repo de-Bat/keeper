@@ -9,7 +9,7 @@ services:
       - ./data:/data
 
   # Optional on-prem LLM. Start with:  docker compose --profile local up -d
-  # then pull a vision model:          docker compose exec ollama ollama pull qwen2.5vl:7b
+  # then pull a vision model:          docker compose exec ollama ollama pull qwen3-vl:8b
   # and set in .env:                   LOCAL_LLM_URL=http://ollama:11434/v1
   ollama:
     image: ollama/ollama:latest

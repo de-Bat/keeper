@@ -218,8 +218,8 @@ def test_normalize_and_parse_helpers():
 # ---- router ---------------------------------------------------------------------
 
 
-def router(tmp_path, mode, local=None, claude=None, ocr=INSTAGRAM_POST):
-    s = Settings(data_dir=tmp_path, analyzer=mode, escalate_below=70)
+def router(tmp_path, mode, local=None, claude=None, ocr=INSTAGRAM_POST, batch=False):
+    s = Settings(data_dir=tmp_path, analyzer=mode, escalate_below=70, claude_batch=batch)
     return AnalyzerRouter(s, httpx.AsyncClient(), ocr=FakeOcr(ocr), claude=claude, local=local)
 
 
