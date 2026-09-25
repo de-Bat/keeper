@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
 
+-- Deleted item ids, so offline clients learn about deletions when they sync.
+CREATE TABLE IF NOT EXISTS tombstones (
+    id         TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tombstones_deleted ON tombstones(deleted_at);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     item_id UNINDEXED, title, summary, tags, body, tokenize='unicode61 remove_diacritics 2'
 );
@@ -51,7 +58,8 @@ EDITABLE_COLUMNS = {
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Microsecond precision: sync cursors compare these strings.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def normalize_tag(tag: str) -> str:
@@ -72,14 +80,24 @@ class Database:
 
     # ---- items -------------------------------------------------------------
 
-    def create_item(self, image_file: str, note: str | None = None, tags: list[str] | None = None) -> dict:
-        item_id = uuid.uuid4().hex[:12]
+    def create_item(
+        self,
+        image_file: str,
+        note: str | None = None,
+        tags: list[str] | None = None,
+        item_id: str | None = None,
+        created_at: str | None = None,
+    ) -> dict:
+        """Create an item. Clients may supply the id (so offline uploads can be retried safely)
+        and the original capture time."""
+        item_id = item_id or uuid.uuid4().hex[:12]
         ts = now()
         with self.conn:
             self.conn.execute(
                 "INSERT INTO items (id, created_at, updated_at, status, image_file, note) VALUES (?, ?, ?, 'processing', ?, ?)",
-                (item_id, ts, ts, image_file, note),
+                (item_id, created_at or ts, ts, image_file, note),
             )
+            self.conn.execute("DELETE FROM tombstones WHERE id = ?", (item_id,))
         if tags:
             self.set_tags(item_id, tags)
         self._reindex(item_id)
@@ -108,6 +126,7 @@ class Database:
             with self.conn:
                 self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
                 self.conn.execute("DELETE FROM items_fts WHERE item_id = ?", (item_id,))
+                self.conn.execute("INSERT OR REPLACE INTO tombstones (id, deleted_at) VALUES (?, ?)", (item_id, now()))
         return item
 
     def list_items(
@@ -140,6 +159,24 @@ class Database:
         rows = self.conn.execute(sql, (*params, limit, offset)).fetchall()
         return [self._row_to_item(r) for r in rows]
 
+    def is_deleted(self, item_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM tombstones WHERE id = ?", (item_id,)).fetchone() is not None
+
+    def changes_since(self, since: str | None) -> dict:
+        """Everything a client needs to catch up: items changed and ids deleted after `since`."""
+        server_time = now()
+        if since:
+            rows = self.conn.execute(
+                "SELECT * FROM items WHERE updated_at >= ? ORDER BY updated_at", (since,)
+            ).fetchall()
+            deleted = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM tombstones WHERE deleted_at >= ?", (since,)
+            ).fetchall()]
+        else:
+            rows = self.conn.execute("SELECT * FROM items ORDER BY updated_at").fetchall()
+            deleted = []
+        return {"server_time": server_time, "items": [self._row_to_item(r) for r in rows], "deleted": deleted}
+
     # ---- tags --------------------------------------------------------------
 
     def set_tags(self, item_id: str, tags: list[str]) -> list[str]:
@@ -147,6 +184,7 @@ class Database:
         with self.conn:
             self.conn.execute("DELETE FROM tags WHERE item_id = ?", (item_id,))
             self.conn.executemany("INSERT INTO tags (item_id, tag) VALUES (?, ?)", [(item_id, t) for t in clean])
+            self.conn.execute("UPDATE items SET updated_at = ? WHERE id = ?", (now(), item_id))
         self._reindex(item_id)
         return clean
 

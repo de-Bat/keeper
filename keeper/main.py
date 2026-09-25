@@ -1,14 +1,18 @@
 """HTTP API and web UI."""
 
+import hmac
 import logging
 import mimetypes
+import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -19,6 +23,8 @@ from .pipeline import Pipeline
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+API_VERSION = 1
 IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -55,6 +61,26 @@ def create_app(
     app = FastAPI(title="Keeper", lifespan=lifespan)
     app.state.db = db
 
+    @app.middleware("http")
+    async def require_token(request: Request, call_next):
+        path = request.url.path
+        protected = path.startswith("/api/") or path.startswith("/media/")
+        if settings.api_token and protected and path != "/api/health":
+            auth = request.headers.get("authorization", "")
+            supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else unquote(request.cookies.get("keeper_token", ""))
+            if not hmac.compare_digest(supplied.encode(), settings.api_token.encode()):
+                return JSONResponse({"detail": "Missing or invalid API token"}, status_code=401)
+        return await call_next(request)
+
+    @app.get("/api/health")
+    def health():
+        return {"ok": True, "api_version": API_VERSION, "auth_required": bool(settings.api_token)}
+
+    @app.get("/api/sync")
+    def sync(since: str | None = Query(None, description="server_time returned by the previous sync")):
+        """Delta sync for offline clients: items changed since the cursor, plus deletions."""
+        return db.changes_since(since)
+
     def get_or_404(item_id: str) -> dict:
         item = db.get_item(item_id)
         if not item:
@@ -67,7 +93,17 @@ def create_app(
         file: UploadFile = File(...),
         note: str | None = Form(None),
         tags: str | None = Form(None, description="Comma-separated tags to add"),
+        id: str | None = Form(None, description="Client-generated id; re-sending the same id is a no-op"),
+        created_at: str | None = Form(None, description="When the screenshot was captured (ISO 8601)"),
     ):
+        if id is not None:
+            if not CLIENT_ID_RE.match(id):
+                raise HTTPException(422, "id must be 8-64 characters of [A-Za-z0-9_-]")
+            existing = db.get_item(id)
+            if existing:
+                return existing
+            if db.is_deleted(id):
+                raise HTTPException(410, "This item was deleted")
         media_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
         if media_type not in IMAGE_TYPES:
             raise HTTPException(415, f"Unsupported image type {media_type!r}; use PNG, JPEG, WebP or GIF")
@@ -78,7 +114,10 @@ def create_app(
             raise HTTPException(400, "Empty file")
         name = uuid.uuid4().hex + IMAGE_TYPES[media_type]
         (settings.uploads_dir / name).write_bytes(data)
-        item = db.create_item(name, note=note or None, tags=[t for t in (tags or "").split(",") if t.strip()])
+        item = db.create_item(
+            name, note=note or None, tags=[t for t in (tags or "").split(",") if t.strip()],
+            item_id=id, created_at=_normalize_time(created_at),
+        )
         background.add_task(state["pipeline"].process, item["id"])
         return item
 
@@ -141,3 +180,15 @@ def create_app(
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
+
+
+def _normalize_time(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "created_at must be ISO 8601")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")

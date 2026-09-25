@@ -23,6 +23,7 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 function safeUrl(url) {
+  if (!url || typeof url !== "string") return null;
   try {
     const u = new URL(url, location.href);
     return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
@@ -46,8 +47,16 @@ function toast(msg) {
   toast._t = setTimeout(() => (t.hidden = true), 3500);
 }
 
-async function api(path, opts = {}) {
+async function api(path, opts = {}, retried = false) {
   const res = await fetch(path, opts);
+  if (res.status === 401 && !retried) {
+    // Self-hosted server with KEEPER_API_TOKEN set: ask once, keep it in a cookie so images load too.
+    const token = prompt("This Keeper server needs an access token:");
+    if (token) {
+      document.cookie = `keeper_token=${encodeURIComponent(token.trim())}; path=/; max-age=31536000; SameSite=Strict`;
+      return api(path, opts, true);
+    }
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch {}
@@ -119,7 +128,7 @@ function renderGrid() {
       <article class="card ${wide ? "wide" : ""} ${item.status}" data-id="${esc(item.id)}">
         <div class="thumb" style="background-image:url('${esc(img)}')"><span class="badge">${esc(badge)}</span></div>
         <div class="body">
-          <div class="title">${esc(item.title || (item.status === "processing" ? "Analyzing screenshot…" : "Untitled"))}</div>
+          <div class="title">${esc(item.title || (item.status === "processing" ? "Analyzing screenshot…" : item.status === "error" ? "Couldn't identify — open to retry" : "Untitled"))}</div>
           ${item.subtitle ? `<div class="sub">${esc(item.subtitle)}</div>` : ""}
           <div class="facts">${cardFacts(item).map((f) => `<span>${esc(f)}</span>`).join("")}</div>
         </div>

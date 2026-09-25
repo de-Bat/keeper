@@ -340,3 +340,62 @@ async def test_analyzer_reports_refusals():
     client, _ = fake_client([SimpleNamespace(stop_reason="refusal", content=[])])
     with pytest.raises(AnalysisError):
         await ScreenshotAnalyzer(client=client).analyze(png_bytes(), "image/png")
+
+
+# ---- self-hosting: sync + auth ---------------------------------------------------
+
+
+def test_offline_client_upload_is_idempotent_and_syncs(settings):
+    client, analyzer = make_client(settings, analysis())
+    with client:
+        start = client.get("/api/sync").json()
+        assert start["items"] == [] and start["deleted"] == []
+        cursor = start["server_time"]
+
+        form = {"id": "ios-3f2a9c1b", "created_at": "2026-09-20T08:30:00Z", "note": "offline"}
+        first = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}, data=form)
+        again = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}, data=form)
+        assert first.json()["id"] == again.json()["id"] == "ios-3f2a9c1b"
+        assert len(analyzer.calls) == 1  # the retry did not trigger a second analysis
+        assert first.json()["created_at"].startswith("2026-09-20T08:30:00")
+
+        delta = client.get("/api/sync", params={"since": cursor}).json()
+        assert [i["id"] for i in delta["items"]] == ["ios-3f2a9c1b"]
+        assert delta["items"][0]["status"] == "ready"
+        cursor = delta["server_time"]
+
+        assert client.get("/api/sync", params={"since": cursor}).json()["items"] == []
+
+        # tag edits bump updated_at so other devices pick them up
+        client.patch("/api/items/ios-3f2a9c1b", json={"tags": ["x"]})
+        delta = client.get("/api/sync", params={"since": cursor}).json()
+        assert delta["items"][0]["tags"] == ["x"]
+        cursor = delta["server_time"]
+
+        client.delete("/api/items/ios-3f2a9c1b")
+        delta = client.get("/api/sync", params={"since": cursor}).json()
+        assert delta == {"server_time": delta["server_time"], "items": [], "deleted": ["ios-3f2a9c1b"]}
+
+        # an offline client that still has the upload queued learns it was deleted
+        gone = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}, data=form)
+        assert gone.status_code == 410
+
+
+def test_rejects_bad_client_ids(settings):
+    client, _ = make_client(settings, analysis())
+    with client:
+        r = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}, data={"id": "../x"})
+        assert r.status_code == 422
+
+
+def test_api_token_required_when_configured(settings):
+    settings.api_token = "s3cret"
+    client, _ = make_client(settings, analysis())
+    with client:
+        assert client.get("/api/health").json()["auth_required"] is True
+        assert client.get("/api/items").status_code == 401
+        assert client.get("/api/items", headers={"Authorization": "Bearer nope"}).status_code == 401
+        assert client.get("/api/items", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+        client.cookies.set("keeper_token", "s3cret")
+        assert client.get("/api/sync").status_code == 200
+        assert client.get("/").status_code == 200  # the web UI shell itself is public

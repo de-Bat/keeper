@@ -94,7 +94,7 @@ a { color: var(--accent); }
 
 .active-filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; align-items: start; }
 .card {
   display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);

@@ -27,6 +27,8 @@ class Settings:
     tmdb_api_key: str | None = field(default_factory=lambda: os.environ.get("TMDB_API_KEY") or None)
     omdb_api_key: str | None = field(default_factory=lambda: os.environ.get("OMDB_API_KEY") or None)
     github_token: str | None = field(default_factory=lambda: os.environ.get("GITHUB_TOKEN") or None)
+    # When set, every API/media request must present this token (clients: Bearer header).
+    api_token: str | None = field(default_factory=lambda: os.environ.get("KEEPER_API_TOKEN") or None)
 
     @property
     def db_path(self) -> Path:

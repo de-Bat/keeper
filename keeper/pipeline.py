@@ -5,6 +5,7 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+import anthropic
 import httpx
 
 from .analyzer import AnalysisError, ScreenshotAnalyzer
@@ -91,6 +92,12 @@ class Pipeline:
             return await self.apply_analysis(item_id, analysis)
         except AnalysisError as e:
             return self.db.update_item(item_id, status="error", error=str(e))
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
+            return self.db.update_item(item_id, status="error", error=(
+                "The server's Anthropic API key is missing or invalid. Set ANTHROPIC_API_KEY and re-analyze."
+            ))
+        except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError) as e:
+            return self.db.update_item(item_id, status="error", error=f"Temporary problem reaching Claude ({type(e).__name__}). Try re-analyzing.")
         except Exception as e:  # keep the item; the user can retry
             log.exception("Processing %s failed", item_id)
             return self.db.update_item(item_id, status="error", error=f"{type(e).__name__}: {e}")
