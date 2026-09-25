@@ -94,6 +94,8 @@ final class SyncEngine: ObservableObject {
                     store.completeOp(op, result: try await api.upload(item: item, image: data, filename: file))
                 case .update(let patch):
                     store.completeOp(op, result: try await api.update(id: op.itemID, patch: patch))
+                case .correct(let correction):
+                    store.completeOp(op, result: try await api.correct(id: op.itemID, correction: correction))
                 case .reanalyze:
                     store.completeOp(op, result: try await api.reanalyze(id: op.itemID))
                 case .delete:

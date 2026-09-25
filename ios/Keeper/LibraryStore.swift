@@ -23,12 +23,13 @@ final class LibraryStore: ObservableObject {
 
     func item(_ id: String) -> Item? { items.first { $0.id == id } }
 
-    func filtered(query: String, category: Category?, tag: String?) -> [Item] {
+    func filtered(query: String, category: Category?, tag: String?, needsReview: Bool = false) -> [Item] {
         let words = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
         return items.filter { item in
             if let category, item.category != category.rawValue { return false }
             if let tag, !item.tags.contains(tag) { return false }
+            if needsReview && !item.needsReview { return false }
             guard !words.isEmpty else { return true }
             let blob = item.searchBlob
             return words.allSatisfy { blob.contains($0) }
@@ -104,6 +105,22 @@ final class LibraryStore: ObservableObject {
         pending.append(PendingOp(itemID: id, kind: .update(patch)))
         save()
     }
+
+    /// Fix a wrong identification. Shown locally right away; the server re-enriches it.
+    func correct(_ id: String, _ correction: Correction) {
+        guard !correction.isEmpty, let i = items.firstIndex(where: { $0.id == id }) else { return }
+        if let title = correction.title { items[i].title = title }
+        if let category = correction.category { items[i].category = category }
+        if !items[i].pendingUpload { items[i].status = "processing" }
+        items[i].error = nil
+        items[i].corrected = true
+        items[i].needsReview = false
+        if correction.hasFacts { items[i].confidence = 100 }
+        pending.append(PendingOp(itemID: id, kind: .correct(correction)))
+        save()
+    }
+
+    var needsReviewCount: Int { items.filter(\.needsReview).count }
 
     func reanalyze(_ id: String) {
         guard let i = items.firstIndex(where: { $0.id == id }), !items[i].pendingUpload else { return }

@@ -144,6 +144,13 @@ struct APIClient {
         return try await send(req)
     }
 
+    func correct(id: String, correction: Correction) async throws -> Item {
+        var req = request("api/items/\(id)/correct", method: "POST")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(correction)
+        return try await send(req)
+    }
+
     func reanalyze(id: String) async throws -> Item {
         try await send(request("api/items/\(id)/reanalyze", method: "POST"))
     }

@@ -105,7 +105,28 @@ SAVE_TOOL: dict[str, Any] = {
             },
             "tags": {"type": "array", "items": {"type": "string"}, "description": "5-10 short lowercase retrieval tags (genre, topic, mood, cuisine, tech...)."},
             "screenshot_text": {"type": "string", "description": "The key text visible in the screenshot, condensed (max ~500 chars)."},
-            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "confidence": {
+                "type": "integer",
+                "description": "0-100: how sure you are that title + category identify the right thing. "
+                               "90+ = confirmed by a matching source; 60-89 = likely; below 60 = a guess.",
+            },
+            "confidence_reason": {"type": "string", "description": "One sentence: what the identification rests on, or what is uncertain."},
+            "alternatives": {
+                "type": "array",
+                "description": "Up to 3 other things the screenshot could plausibly be (empty if confident).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "category": {"type": "string", "enum": CATEGORIES},
+                        "year": {"type": ["integer", "null"]},
+                        "canonical_url": _nstr,
+                        "why": {"type": "string"},
+                    },
+                    "required": ["title", "category", "year", "canonical_url", "why"],
+                    "additionalProperties": False,
+                },
+            },
             "details": DETAILS_SCHEMA,
         },
         "additionalProperties": False,
@@ -122,11 +143,28 @@ How to work:
 2. Use web search to confirm the identity and find the canonical source. For films and TV find the IMDb page and scores; for code find the github.com repository; for recipes find the original recipe page; for articles find the article URL.
 3. Only report URLs, ratings and facts you actually saw in search results or the screenshot. Use null rather than guessing.
 4. If the screenshot recommends several things, catalogue the most prominent one and mention the others in the summary.
-5. Finish by calling save_analysis once. Do not ask the user questions."""
+5. Be honest about confidence. Score it on evidence: a clearly visible title confirmed by a matching search result is 90+; an inference from partial text, a blurry poster, or an ambiguous title (remakes, same-name books and films) is lower. List the plausible alternatives.
+6. If the user has corrected an earlier identification, treat their correction as authoritative and look up what they describe.
+7. Finish by calling save_analysis once. Do not ask the user questions."""
 
 
 class AnalysisError(Exception):
     pass
+
+
+def correction_prompt(correction: dict) -> str:
+    """Describe a user's correction of an earlier (wrong) identification."""
+    lines = ["An earlier identification of this screenshot was wrong."]
+    if correction.get("previous_title"):
+        lines.append(f"It was identified as: {correction['previous_title']} ({correction.get('previous_category') or 'unknown type'}).")
+    facts = {k: correction.get(k) for k in ("title", "category", "year", "canonical_url")}
+    known = ", ".join(f"{k} = {v}" for k, v in facts.items() if v not in (None, ""))
+    if known:
+        lines.append(f"The user says the correct {known}.")
+    if correction.get("hint"):
+        lines.append(f"The user's correction: {correction['hint']}")
+    lines.append("Identify it again using this information.")
+    return " ".join(lines)
 
 
 def prepare_image(data: bytes, media_type: str) -> tuple[bytes, str]:
@@ -154,11 +192,15 @@ class ScreenshotAnalyzer:
         self.client = client or anthropic.AsyncAnthropic()
         self.model = model
 
-    async def analyze(self, image: bytes, media_type: str, note: str | None = None) -> dict:
+    async def analyze(
+        self, image: bytes, media_type: str, note: str | None = None, correction: dict | None = None,
+    ) -> dict:
         image, media_type = prepare_image(image, media_type)
         prompt = "Identify what this screenshot is recommending and catalogue it."
         if note:
             prompt += f"\n\nThe user added this note when saving it: {note}"
+        if correction:
+            prompt += "\n\n" + correction_prompt(correction)
         messages: list[dict] = [{
             "role": "user",
             "content": [

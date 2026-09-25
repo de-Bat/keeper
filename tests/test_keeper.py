@@ -34,7 +34,9 @@ def analysis(**overrides):
         "links": [],
         "tags": ["python", "Package Manager"],
         "screenshot_text": "You have to try uv, it replaced pip for me",
-        "confidence": "high",
+        "confidence": 92,
+        "confidence_reason": "Repo name is legible and matches github.com/astral-sh/uv.",
+        "alternatives": [],
         "details": blank_details(github_full_name="astral-sh/uv", posted_by="Some Dev"),
     }
     base.update(overrides)
@@ -51,9 +53,11 @@ class FakeAnalyzer:
     def __init__(self, result):
         self.result = result
         self.calls = []
+        self.corrections = []
 
-    async def analyze(self, image, media_type, note=None):
+    async def analyze(self, image, media_type, note=None, correction=None):
         self.calls.append((media_type, note))
+        self.corrections.append(correction)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -399,3 +403,136 @@ def test_api_token_required_when_configured(settings):
         client.cookies.set("keeper_token", "s3cret")
         assert client.get("/api/sync").status_code == 200
         assert client.get("/").status_code == 200  # the web UI shell itself is public
+
+
+# ---- confidence & manual correction ---------------------------------------------
+
+
+def test_confidence_and_alternatives_are_stored_and_low_confidence_is_flagged(settings):
+    guess = analysis(
+        category="movie", title="Dune", year=1984, canonical_url=None, confidence=45,
+        confidence_reason="Only a desert still is visible; could be either adaptation.",
+        alternatives=[{"title": "Dune: Part Two", "category": "movie", "year": 2024,
+                       "canonical_url": "https://www.imdb.com/title/tt15239678/", "why": "Same visual style"}],
+        details=blank_details(), tags=["sci-fi"],
+    )
+    client, _ = make_client(settings, guess)
+    with client:
+        item_id = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}).json()["id"]
+        item = client.get(f"/api/items/{item_id}").json()
+        assert item["confidence"] == 45
+        assert item["confidence_reason"].startswith("Only a desert")
+        assert item["alternatives"][0]["title"] == "Dune: Part Two"
+        assert item["needs_review"] is True and item["corrected"] is False
+        assert [i["id"] for i in client.get("/api/items", params={"needs_review": True}).json()] == [item_id]
+
+
+def test_correct_with_facts_reenriches_without_the_model(settings):
+    settings.tmdb_api_key = "k"
+    routes = {
+        "https://api.themoviedb.org/3/find/tt15239678": httpx.Response(200, json={"movie_results": [{"id": 693134}]}),
+        "https://api.themoviedb.org/3/movie/693134": httpx.Response(200, json={
+            "id": 693134, "vote_average": 8.2, "genres": [{"name": "Science Fiction"}], "overview": "Paul unites with the Fremen.",
+            "poster_path": "/dune2.jpg", "external_ids": {"imdb_id": "tt15239678"}, "credits": {}, "videos": {}, "watch/providers": {},
+        }),
+    }
+    wrong = analysis(category="movie", title="Dune", year=1984, canonical_url="https://www.imdb.com/title/tt0087182/",
+                     confidence=45, details=blank_details(imdb_id="tt0087182", posted_by="Film Club"),
+                     tags=["lynch", "cult-classic"], summary="David Lynch's 1984 adaptation.")
+    client, analyzer = make_client(settings, wrong, routes)
+    with client:
+        item_id = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}, data={"tags": "watchlist"}).json()["id"]
+        r = client.post(f"/api/items/{item_id}/correct", json={
+            "title": "Dune: Part Two", "year": 2024, "canonical_url": "https://www.imdb.com/title/tt15239678/"})
+        assert r.status_code == 202
+        item = client.get(f"/api/items/{item_id}").json()
+
+    assert len(analyzer.calls) == 1  # no second model call
+    assert item["status"] == "ready"
+    assert item["title"] == "Dune: Part Two"
+    assert item["canonical_url"] == "https://www.imdb.com/title/tt15239678/"
+    assert item["image_url"] == "https://image.tmdb.org/t/p/w500/dune2.jpg"
+    assert item["summary"] == "Paul unites with the Fremen."          # the wrong film's summary is gone
+    assert item["metadata"]["year"] == 2024
+    assert item["metadata"]["posted_by"] == "Film Club"                # facts about the post survive
+    assert "imdb_id" in item["metadata"] and item["metadata"]["imdb_id"] == "tt15239678"
+    assert item["confidence"] == 100 and item["corrected"] is True and item["needs_review"] is False
+    assert item["alternatives"] == []
+    assert "watchlist" in item["tags"]                                  # the user's tag stays
+    assert "lynch" not in item["tags"] and "science-fiction" in item["tags"]
+
+
+def test_correct_with_hint_asks_the_model_again(settings):
+    client, analyzer = make_client(settings, analysis(category="movie", title="The Office", confidence=50, details=blank_details()))
+    with client:
+        item_id = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}).json()["id"]
+        analyzer.result = analysis(category="tv_show", title="The Office (US)", confidence=88, details=blank_details(),
+                                   canonical_url=None)
+        client.post(f"/api/items/{item_id}/correct", json={"hint": "It's the American TV series", "category": "tv_show"})
+        item = client.get(f"/api/items/{item_id}").json()
+
+    assert analyzer.corrections[1]["hint"] == "It's the American TV series"
+    assert analyzer.corrections[1]["previous_title"] == "The Office"
+    assert item["title"] == "The Office (US)" and item["category"] == "tv_show"
+    assert item["corrected"] is True
+    assert item["confidence"] == 100  # an explicit fact (category) was given
+
+
+def test_correct_validates_input(settings):
+    client, _ = make_client(settings, analysis())
+    with client:
+        item_id = client.post("/api/items", files={"file": ("s.png", png_bytes(), "image/png")}).json()["id"]
+        assert client.post(f"/api/items/{item_id}/correct", json={}).status_code == 422
+        assert client.post(f"/api/items/{item_id}/correct", json={"category": "nope"}).status_code == 422
+        assert client.post(f"/api/items/{item_id}/correct", json={"canonical_url": "javascript:alert(1)"}).status_code == 422
+        assert client.post("/api/items/missing/correct", json={"title": "x"}).status_code == 404
+
+
+def test_correction_prompt_mentions_previous_and_new_facts():
+    from keeper.analyzer import correction_prompt
+    text = correction_prompt({"previous_title": "Dune", "previous_category": "movie", "year": 2024, "hint": "the sequel"})
+    assert "Dune" in text and "year = 2024" in text and "the sequel" in text
+
+
+def test_legacy_confidence_labels_map_to_scores():
+    from keeper.pipeline import confidence_score
+    assert confidence_score("high") == 90 and confidence_score("low") == 40
+    assert confidence_score(140) == 100 and confidence_score(-3) == 0 and confidence_score(None) is None
+
+
+def test_existing_database_is_migrated(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE items (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        status TEXT NOT NULL, error TEXT, image_file TEXT NOT NULL, note TEXT, category TEXT, source_platform TEXT,
+        title TEXT, subtitle TEXT, summary TEXT, canonical_url TEXT, image_url TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}', links TEXT NOT NULL DEFAULT '[]', analysis TEXT)""")
+    conn.execute("INSERT INTO items (id, created_at, updated_at, status, image_file) VALUES ('old1', 't', 't', 'ready', 'a.png')")
+    conn.commit()
+    conn.close()
+    item = Database(path).get_item("old1")
+    assert item["confidence"] is None and item["alternatives"] == [] and item["corrected"] is False
+
+
+# ---- PWA -------------------------------------------------------------------------
+
+
+def test_pwa_assets_are_served(settings):
+    settings.api_token = "s3cret"  # the app shell must load before the user has entered a token
+    client, _ = make_client(settings, analysis())
+    with client:
+        sw = client.get("/sw.js")
+        assert sw.status_code == 200
+        assert sw.headers["service-worker-allowed"] == "/"
+        assert "no-cache" in sw.headers["cache-control"]
+        assert "javascript" in sw.headers["content-type"]
+        manifest = client.get("/static/manifest.webmanifest")
+        assert manifest.headers["content-type"].startswith("application/manifest+json")
+        assert manifest.json()["display"] == "standalone"
+        for icon in manifest.json()["icons"]:
+            assert client.get(icon["src"]).status_code == 200
+        assert client.get("/static/icons/apple-touch-icon.png").status_code == 200
+        index = client.get("/").text
+        assert 'rel="manifest"' in index and "apple-mobile-web-app-capable" in index
+        assert client.post("/share-target", follow_redirects=False).status_code == 303

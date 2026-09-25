@@ -66,6 +66,37 @@ struct ItemLink: Codable, Equatable, Hashable {
     var url: String
 }
 
+/// Something else the model thinks the screenshot might be.
+struct Alternative: Codable, Equatable, Hashable {
+    var title: String
+    var category: String?
+    var year: Int?
+    var canonicalUrl: String?
+    var why: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title, category, year, why
+        case canonicalUrl = "canonical_url"
+    }
+}
+
+/// "The model got it wrong": corrected facts, and/or a description for Claude to look again.
+struct Correction: Codable, Equatable {
+    var title: String?
+    var category: String?
+    var year: Int?
+    var canonicalUrl: String?
+    var hint: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title, category, year, hint
+        case canonicalUrl = "canonical_url"
+    }
+
+    var isEmpty: Bool { title == nil && category == nil && year == nil && canonicalUrl == nil && hint == nil }
+    var hasFacts: Bool { title != nil || category != nil || year != nil || canonicalUrl != nil }
+}
+
 struct Item: Codable, Identifiable, Equatable {
     var id: String
     var createdAt: String
@@ -84,6 +115,11 @@ struct Item: Codable, Identifiable, Equatable {
     var metadata: [String: JSONValue]
     var links: [ItemLink]
     var tags: [String]
+    var confidence: Int?               // 0-100, how sure the model is (100 once corrected)
+    var confidenceReason: String?
+    var alternatives: [Alternative]
+    var corrected: Bool
+    var needsReview: Bool
 
     // Local-only state
     var localImage: String?            // file name in AppGroup.images
@@ -94,6 +130,8 @@ struct Item: Codable, Identifiable, Equatable {
         case createdAt = "created_at", updatedAt = "updated_at", imageFile = "image_file"
         case sourcePlatform = "source_platform", canonicalUrl = "canonical_url", imageUrl = "image_url"
         case localImage = "local_image", pendingUpload = "pending_upload"
+        case confidence, alternatives, corrected
+        case confidenceReason = "confidence_reason", needsReview = "needs_review"
     }
 
     init(localID: String, localImage: String, note: String?, createdAt: Date) {
@@ -108,6 +146,9 @@ struct Item: Codable, Identifiable, Equatable {
         metadata = [:]
         links = []
         tags = []
+        alternatives = []
+        corrected = false
+        needsReview = false
     }
 
     init(from decoder: Decoder) throws {
@@ -129,6 +170,11 @@ struct Item: Codable, Identifiable, Equatable {
         metadata = (try? c.decodeIfPresent([String: JSONValue].self, forKey: .metadata)) ?? [:]
         links = (try? c.decodeIfPresent([ItemLink].self, forKey: .links)) ?? []
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        confidence = try? c.decodeIfPresent(Int.self, forKey: .confidence)
+        confidenceReason = try c.decodeIfPresent(String.self, forKey: .confidenceReason)
+        alternatives = (try? c.decodeIfPresent([Alternative].self, forKey: .alternatives)) ?? []
+        corrected = (try? c.decodeIfPresent(Bool.self, forKey: .corrected)) ?? false
+        needsReview = (try? c.decodeIfPresent(Bool.self, forKey: .needsReview)) ?? false
         localImage = try c.decodeIfPresent(String.self, forKey: .localImage)
         pendingUpload = try c.decodeIfPresent(Bool.self, forKey: .pendingUpload) ?? false
     }
@@ -173,6 +219,7 @@ struct PendingOp: Codable, Identifiable, Equatable {
     enum Kind: Codable, Equatable {
         case upload
         case update(ItemPatch)
+        case correct(Correction)
         case reanalyze
         case delete
     }

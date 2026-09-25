@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS items (
     image_url       TEXT,                   -- poster / cover / preview image
     metadata        TEXT NOT NULL DEFAULT '{}',
     links           TEXT NOT NULL DEFAULT '[]',
-    analysis        TEXT                    -- raw model output, kept for debugging / re-enrichment
+    analysis        TEXT,                   -- raw model output, kept for debugging / re-enrichment
+    confidence      INTEGER,                -- 0-100, how sure the model is; 100 once the user corrects it
+    confidence_reason TEXT,
+    alternatives    TEXT NOT NULL DEFAULT '[]',  -- other things it might be: [{title, category, year, canonical_url, why}]
+    corrected       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS items_category ON items(category);
 CREATE INDEX IF NOT EXISTS items_created ON items(created_at);
@@ -50,10 +54,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
 );
 """
 
-JSON_COLUMNS = ("metadata", "links", "analysis")
+JSON_COLUMNS = ("metadata", "links", "analysis", "alternatives")
+
+# Columns added after the first release; created on startup for existing databases.
+MIGRATIONS = {
+    "confidence": "INTEGER",
+    "confidence_reason": "TEXT",
+    "alternatives": "TEXT NOT NULL DEFAULT '[]'",
+    "corrected": "INTEGER NOT NULL DEFAULT 0",
+}
+# Below this confidence an identification is flagged for the user to check.
+REVIEW_THRESHOLD = 60
+
 EDITABLE_COLUMNS = {
     "status", "error", "note", "category", "source_platform", "title", "subtitle",
     "summary", "canonical_url", "image_url", "metadata", "links", "analysis",
+    "confidence", "confidence_reason", "alternatives", "corrected",
 }
 
 
@@ -77,6 +93,11 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(items)")}
+        with self.conn:
+            for column, ddl in MIGRATIONS.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} {ddl}")
 
     # ---- items -------------------------------------------------------------
 
@@ -134,6 +155,7 @@ class Database:
         q: str | None = None,
         category: str | None = None,
         tags: list[str] | None = None,
+        needs_review: bool = False,
         limit: int = 200,
         offset: int = 0,
     ) -> list[dict]:
@@ -149,6 +171,8 @@ class Database:
         if category:
             where.append("i.category = ?")
             params.append(category)
+        if needs_review:
+            where.append(f"i.status = 'ready' AND i.corrected = 0 AND i.confidence < {REVIEW_THRESHOLD}")
         for tag in tags or []:
             where.append("EXISTS (SELECT 1 FROM tags t WHERE t.item_id = i.id AND t.tag = ?)")
             params.append(normalize_tag(tag))
@@ -216,6 +240,11 @@ class Database:
                 except json.JSONDecodeError:
                     pass
         item.setdefault("metadata", {})
+        item["corrected"] = bool(item.get("corrected"))
+        item["needs_review"] = (
+            item.get("status") == "ready" and not item["corrected"]
+            and item.get("confidence") is not None and item["confidence"] < REVIEW_THRESHOLD
+        )
         item["tags"] = self.get_tags(item["id"])
         return item
 

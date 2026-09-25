@@ -114,6 +114,9 @@ async def enrich_screen(analysis: dict, settings: Settings, http: httpx.AsyncCli
     is_tv = analysis.get("category") == "tv_show"
     details = analysis.get("details") or {}
     imdb_id = details.get("imdb_id")
+    if not imdb_id:
+        m = re.search(r"imdb\.com/title/(tt\d+)", analysis.get("canonical_url") or "")
+        imdb_id = m.group(1) if m else None
     out = Enrichment(source="tmdb")
 
     if settings.tmdb_api_key:

@@ -8,11 +8,12 @@ struct LibraryView: View {
     @State private var query = ""
     @State private var category: Category?
     @State private var tag: String?
+    @State private var needsReview = false
     @State private var picked: [PhotosPickerItem] = []
     @State private var showSettings = false
     @State private var message: String?
 
-    private var results: [Item] { store.filtered(query: query, category: category, tag: tag) }
+    private var results: [Item] { store.filtered(query: query, category: category, tag: tag, needsReview: needsReview) }
 
     var body: some View {
         NavigationStack {
@@ -67,6 +68,11 @@ struct LibraryView: View {
     private var filters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if store.needsReviewCount > 0 {
+                    Chip(label: "Needs review \(store.needsReviewCount)", systemImage: "exclamationmark.triangle", active: needsReview) {
+                        needsReview.toggle()
+                    }
+                }
                 ForEach(store.categoryCounts, id: \.0) { c, count in
                     Chip(label: "\(c.label) \(count)", systemImage: c.symbol, active: category == c) {
                         category = category == c ? nil : c
@@ -135,6 +141,12 @@ struct ItemCard: View {
             ItemImage(item: item)
                 .aspectRatio(category?.isPortrait == true ? 2 / 3 : 16 / 10, contentMode: .fit)
                 .overlay(alignment: .topLeading) { badge.padding(6) }
+                .overlay(alignment: .topTrailing) {
+                    if item.needsReview, let c = item.confidence {
+                        Label("\(c)%", systemImage: "questionmark.circle.fill").badgeStyle(.orange).padding(6)
+                            .accessibilityLabel("Not sure: \(c) percent confident")
+                    }
+                }
                 .overlay {
                     if item.status == "processing" || item.status == "queued" {
                         Color.black.opacity(0.35)

@@ -10,6 +10,7 @@ struct ItemDetailView: View {
     @State private var note = ""
     @State private var confirmDelete = false
     @State private var showScreenshot = false
+    @State private var showCorrection = false
 
     /// Metadata shown in dedicated sections (or not worth showing) rather than the facts list.
     private static let hiddenKeys: Set<String> = [
@@ -41,6 +42,7 @@ struct ItemDetailView: View {
                     }
                 }
                 statusRow(item)
+                confidenceSection(item)
                 scores(item)
                 if let summary = item.summary { Text(summary) }
                 if let url = item.canonicalUrl.flatMap(URL.init(string:)) {
@@ -130,6 +132,12 @@ struct ItemDetailView: View {
             }
         }
         .sheet(isPresented: $showScreenshot) { ScreenshotSheet(item: item) }
+        .sheet(isPresented: $showCorrection) {
+            CorrectionSheet(item: item) { correction in
+                store.correct(item.id, correction)
+                sync.requestSync()
+            }
+        }
     }
 
     @ViewBuilder
@@ -143,6 +151,49 @@ struct ItemDetailView: View {
             Label("Identifying… this usually takes under a minute.", systemImage: "sparkles").font(.footnote).foregroundStyle(.secondary)
         } else if store.hasPendingOps(for: item.id) {
             Label("Changes waiting to sync", systemImage: "arrow.triangle.2.circlepath").font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func confidenceSection(_ item: Item) -> some View {
+        if item.status == "ready" && !item.pendingUpload {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    if item.corrected {
+                        Label("Corrected by you", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+                    } else if let c = item.confidence {
+                        Text("\(c)% sure").bold()
+                        ProgressView(value: Double(c), total: 100)
+                            .tint(c >= 85 ? .green : c >= 60 ? .yellow : .red)
+                            .frame(width: 80)
+                    }
+                    Spacer()
+                    Button(item.needsReview ? "Is this wrong?" : "Wrong? Fix it") { showCorrection = true }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
+                .font(.subheadline)
+                if !item.corrected, let reason = item.confidenceReason {
+                    Text(reason).font(.footnote).foregroundStyle(.secondary)
+                }
+                if !item.corrected && !item.alternatives.isEmpty {
+                    Text("Did you mean:").font(.footnote).foregroundStyle(.secondary)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack {
+                            ForEach(item.alternatives, id: \.self) { alt in
+                                Chip(label: alt.year.map { "\(alt.title) (\($0))" } ?? alt.title,
+                                     systemImage: Category(rawValue: alt.category ?? "")?.symbol) {
+                                    store.correct(item.id, Correction(title: alt.title, category: alt.category,
+                                                                      year: alt.year, canonicalUrl: alt.canonicalUrl))
+                                    sync.requestSync()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(10)
+            .background(item.needsReview ? Color.orange.opacity(0.12) : Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 10))
         }
     }
 
@@ -208,6 +259,82 @@ private struct ScreenshotSheet: View {
             }
             .toolbar { Button("Done") { dismiss() } }
             .task { image = await ItemImage.screenshot(for: item) }
+        }
+    }
+}
+
+/// "What is it really?" Fix the facts directly, or describe it and let Claude look again.
+private struct CorrectionSheet: View {
+    let item: Item
+    let onSave: (Correction) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title: String
+    @State private var category: String
+    @State private var year: String
+    @State private var link: String
+    @State private var hint = ""
+
+    init(item: Item, onSave: @escaping (Correction) -> Void) {
+        self.item = item
+        self.onSave = onSave
+        _title = State(initialValue: item.title ?? "")
+        _category = State(initialValue: item.category ?? "other")
+        _year = State(initialValue: item.meta("year") ?? "")
+        _link = State(initialValue: item.canonicalUrl ?? "")
+    }
+
+    private var correction: Correction {
+        func changed(_ new: String, _ old: String?) -> String? {
+            let v = new.trimmingCharacters(in: .whitespacesAndNewlines)
+            return v.isEmpty || v == (old ?? "") ? nil : v
+        }
+        let yearValue = Int(year.trimmingCharacters(in: .whitespaces))
+        return Correction(
+            title: changed(title, item.title),
+            category: category == item.category ? nil : category,
+            year: yearValue.flatMap { String($0) == item.meta("year") ? nil : $0 },
+            canonicalUrl: changed(link, item.canonicalUrl),
+            hint: changed(hint, nil)
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Title", text: $title)
+                    Picker("Type", selection: $category) {
+                        ForEach(Category.allCases) { Label($0.label, systemImage: $0.symbol).tag($0.rawValue) }
+                    }
+                    TextField("Year", text: $year).keyboardType(.numberPad)
+                    TextField("Link (IMDb, GitHub, recipe page…)", text: $link)
+                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                } header: {
+                    Text("What is it really?")
+                } footer: {
+                    Text("Keeper looks up posters, scores and details for what you enter.")
+                }
+                Section {
+                    TextField("e.g. “It's the 2019 remake, not the original”", text: $hint, axis: .vertical)
+                } header: {
+                    Text("Or describe it")
+                } footer: {
+                    Text("Claude looks at the screenshot again with your description.")
+                }
+            }
+            .navigationTitle("Fix identification")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave(correction)
+                        dismiss()
+                    }
+                    .disabled(correction.isEmpty)
+                }
+            }
         }
     }
 }

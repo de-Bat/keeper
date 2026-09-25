@@ -12,7 +12,7 @@ from urllib.parse import unquote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -22,12 +22,22 @@ from .db import Database
 from .pipeline import Pipeline
 
 STATIC_DIR = Path(__file__).parent / "static"
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 API_VERSION = 1
 IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+class Correction(BaseModel):
+    """What the user says the screenshot really is. Give facts, a free-text hint, or both."""
+    title: str | None = None
+    category: str | None = None
+    year: int | None = None
+    canonical_url: str | None = None
+    hint: str | None = None  # e.g. "it's the 2019 remake, not the original" -> Claude looks again
 
 
 class ItemPatch(BaseModel):
@@ -126,10 +136,11 @@ def create_app(
         q: str | None = None,
         category: str | None = None,
         tag: list[str] = Query(default=[]),
+        needs_review: bool = False,
         limit: int = Query(200, le=500),
         offset: int = 0,
     ):
-        return db.list_items(q=q, category=category, tags=tag, limit=limit, offset=offset)
+        return db.list_items(q=q, category=category, tags=tag, needs_review=needs_review, limit=limit, offset=offset)
 
     @app.get("/api/items/{item_id}")
     def get_item(item_id: str):
@@ -151,6 +162,23 @@ def create_app(
         get_or_404(item_id)
         item = db.update_item(item_id, status="processing", error=None)
         background.add_task(state["pipeline"].process, item_id)
+        return item
+
+    @app.post("/api/items/{item_id}/correct", status_code=202)
+    def correct(item_id: str, correction: Correction, background: BackgroundTasks):
+        """Fix a wrong identification. The item is re-enriched in the background."""
+        get_or_404(item_id)
+        fix = {k: (v.strip() if isinstance(v, str) else v) for k, v in correction.model_dump().items()}
+        fix = {k: v for k, v in fix.items() if v not in (None, "")}
+        if not fix:
+            raise HTTPException(422, "Give at least one of title, category, year, canonical_url or hint")
+        if "category" in fix and fix["category"] not in CATEGORIES:
+            raise HTTPException(422, f"category must be one of {CATEGORIES}")
+        if "canonical_url" in fix and not re.match(r"^https?://", fix["canonical_url"]):
+            raise HTTPException(422, "canonical_url must start with http:// or https://")
+        preview = {k: fix[k] for k in ("title", "category") if k in fix}
+        item = db.update_item(item_id, status="processing", error=None, **preview)
+        background.add_task(state["pipeline"].correct, item_id, fix)
         return item
 
     @app.delete("/api/items/{item_id}", status_code=204)
@@ -176,7 +204,20 @@ def create_app(
 
     @app.get("/")
     def index():
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/sw.js")
+    def service_worker():
+        # Served from the root so it can control the whole app; never cached so updates ship.
+        return FileResponse(
+            STATIC_DIR / "sw.js", media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+        )
+
+    @app.post("/share-target")
+    def share_target_fallback():
+        # Normally the service worker handles shares; if it isn't active yet, just open the app.
+        return RedirectResponse("/", status_code=303)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
